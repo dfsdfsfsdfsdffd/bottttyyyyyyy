@@ -9,6 +9,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
 } from "discord.js";
 import fs from "fs";
 import path from "path";
@@ -46,7 +47,7 @@ const MIN_SYNC_MS = 15_000;
 const STORAGE_DIR = "./data";
 const STORAGE_FILE = path.join(STORAGE_DIR, "storage.json");
 const PFP_OUTPUT_DIR = path.join(STORAGE_DIR, "scraped_pfps");
-const DEFAULT_STORAGE = { serverSetups: {}, serverMessageCounters: {}, userStorage: {}, userItems: {}, exploreCooldowns: {} };
+const DEFAULT_STORAGE = { serverSetups: {}, serverMessageCounters: {}, userStorage: {}, userItems: {}, exploreCooldowns: {}, catCare: {} };
 
 function initStorage() {
   try {
@@ -342,17 +343,28 @@ const EXPLORE_COOLDOWN_MS = 4 * 60 * 1000;
 const EXPLORE_ITEMS = [
   { name: "Yarn Ball", rarity: "Common", weight: 45, points: 1 },
   { name: "Cat Treat", rarity: "Common", weight: 40, points: 1 },
+  { name: "Fish Snack", rarity: "Common", weight: 34, points: 1 },
   { name: "Scratched Coin", rarity: "Uncommon", weight: 22, points: 3 },
   { name: "Tiny Bell", rarity: "Uncommon", weight: 18, points: 3 },
+  { name: "Cozy Blanket", rarity: "Uncommon", weight: 14, points: 3 },
   { name: "Moon Whisker", rarity: "Rare", weight: 9, points: 8 },
   { name: "Golden Paw", rarity: "Epic", weight: 4, points: 20 },
   { name: "Ancient Catnip", rarity: "Legendary", weight: 1, points: 60 },
 ];
+const CAT_FOOD_ITEMS = new Set(["Cat Treat", "Fish Snack", "Ancient Catnip"]);
+const RARITY_ORDER = ["Common", "Uncommon", "Rare", "Epic", "Legendary"];
+const CAT_UPGRADE_RECIPES = {
+  Common: { next: "Uncommon", items: { "Cat Treat": 3, "Yarn Ball": 2 } },
+  Uncommon: { next: "Rare", items: { "Fish Snack": 4, "Tiny Bell": 2 } },
+  Rare: { next: "Epic", items: { "Moon Whisker": 3, "Cozy Blanket": 2 } },
+  Epic: { next: "Legendary", items: { "Golden Paw": 2, "Ancient Catnip": 1 } },
+};
 const HELP_LINES = [
   "`/help` - Show every command and what it does.",
   "`/serversetup [channel]` - Set the channel where wild cats spawn.",
   "`/pickup` - Claim the active wild cat in the current channel.",
   "`/explore` - Search for items with a chance to find a cat.",
+  "`/catcare` - Pick a favorite cat, feed it, play with it, and upgrade it.",
   "`/catstorage` - View your cat vault, score, total cats, and unique cats.",
   "`/catdex` - View collection progress by rarity.",
   "`/catleaderboard` - Show the top cat collectors.",
@@ -420,6 +432,88 @@ function getUserItems(userId) {
     .map(([name, quantity]) => ({ name, quantity }))
     .filter((item) => Number(item.quantity) > 0)
     .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
+function getUserItemQuantity(userId, itemName) {
+  const state = loadData();
+  return Number(state.userItems[userId]?.[itemName] || 0);
+}
+
+function removeUserItem(userId, itemName, amount = 1) {
+  const state = loadData();
+  const bag = state.userItems[userId];
+  if (!bag || Number(bag[itemName] || 0) < amount) return false;
+  bag[itemName] = Number(bag[itemName]) - amount;
+  if (bag[itemName] <= 0) delete bag[itemName];
+  saveData(state);
+  return true;
+}
+
+function hasRecipeItems(userId, recipe) {
+  return Object.entries(recipe.items).every(([itemName, amount]) => getUserItemQuantity(userId, itemName) >= amount);
+}
+
+function consumeRecipeItems(userId, recipe) {
+  if (!hasRecipeItems(userId, recipe)) return false;
+  for (const [itemName, amount] of Object.entries(recipe.items)) {
+    removeUserItem(userId, itemName, amount);
+  }
+  return true;
+}
+
+function careDefaults(catName = "") {
+  return {
+    favoriteCat: catName,
+    hunger: 70,
+    happiness: 70,
+    level: 1,
+    xp: 0,
+    lastCareAt: Date.now(),
+  };
+}
+
+function normalizedCare(userId) {
+  const state = loadData();
+  const current = { ...careDefaults(), ...(state.catCare[userId] || {}) };
+  const hoursPassed = Math.max(0, Math.floor((Date.now() - Number(current.lastCareAt || Date.now())) / (60 * 60 * 1000)));
+  if (hoursPassed > 0) {
+    current.hunger = Math.max(0, Number(current.hunger || 0) - hoursPassed * 4);
+    current.happiness = Math.max(0, Number(current.happiness || 0) - hoursPassed * 3);
+    current.lastCareAt = Date.now();
+    state.catCare[userId] = current;
+    saveData(state);
+  }
+  return current;
+}
+
+function saveCare(userId, care) {
+  const state = loadData();
+  state.catCare[userId] = { ...care, lastCareAt: Date.now() };
+  saveData(state);
+}
+
+function careEmbed(user, care, title = "Cat Care") {
+  const cat = catRef(care.favoriteCat);
+  const recipe = cat ? CAT_UPGRADE_RECIPES[cat.rarity] : null;
+  const recipeText = recipe
+    ? Object.entries(recipe.items).map(([item, amount]) => `${item} x${amount}`).join(", ")
+    : "Max rarity reached.";
+
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(cat ? `${cat.emoji} **${cat.name}** [${cat.rarity}]` : "No favorite cat selected yet. Use `/catcare favorite cat:<name>`.")
+    .addFields(
+      { name: "Stats", value: `Hunger: **${care.hunger}/100**\nHappiness: **${care.happiness}/100**\nLevel: **${care.level}** | XP: **${care.xp}**`, inline: true },
+      { name: "Upgrade", value: recipe ? `Next: **${recipe.next}**\nNeeds: ${recipeText}` : recipeText, inline: true },
+      { name: "How to care", value: "Explore for food/items with `/explore`, then use `/catcare feed`, `/catcare play`, or `/catcare upgrade`.", inline: false }
+    )
+    .setFooter({ text: user.username })
+    .setColor(cat?.rarity === "Legendary" ? 0xf5b942 : cat?.rarity === "Epic" ? 0x9b5cff : cat?.rarity === "Rare" ? 0x4ea1ff : 0x62d26f);
+}
+
+function randomCatByRarity(rarity) {
+  const matches = CATS.filter((cat) => cat.rarity === rarity);
+  return matches[Math.floor(Math.random() * matches.length)] || null;
 }
 
 function getExploreCooldown(userId) {
@@ -670,6 +764,25 @@ client.once("ready", async () => {
     new SlashCommandBuilder().setName("catdex").setDescription("View your cat collection progress by rarity"),
     new SlashCommandBuilder().setName("catleaderboard").setDescription("View the richest cat collectors"),
     new SlashCommandBuilder()
+      .setName("catcare")
+      .setDescription("Care for one favorite cat in one command")
+      .addSubcommand((subcommand) => subcommand.setName("status").setDescription("Show your favorite cat care panel"))
+      .addSubcommand((subcommand) =>
+        subcommand
+          .setName("favorite")
+          .setDescription("Pick the cat you want to care for")
+          .addStringOption((option) => option.setName("cat").setDescription("Cat name").setRequired(true))
+      )
+      .addSubcommand((subcommand) =>
+        subcommand
+          .setName("feed")
+          .setDescription("Feed your favorite cat")
+          .addStringOption((option) => option.setName("food").setDescription("Food item name").setRequired(false))
+      )
+      .addSubcommand((subcommand) => subcommand.setName("play").setDescription("Play with your favorite cat using a Yarn Ball or Tiny Bell"))
+      .addSubcommand((subcommand) => subcommand.setName("upgrade").setDescription("Upgrade your favorite cat to a higher rarity if you have the items"))
+      .addSubcommand((subcommand) => subcommand.setName("bag").setDescription("Show your explore items")),
+    new SlashCommandBuilder()
       .setName("trade")
       .setDescription("Trade or gift your cats safely with another player")
       .addUserOption((option) => option.setName("user").setDescription("The user you want to trade with").setRequired(true))
@@ -913,13 +1026,14 @@ client.on("interactionCreate", async (interaction) => {
 
   // --- PRE-EXISTING COMMANDS ---
   if (commandName === "help") {
+    const helpEmbed = new EmbedBuilder()
+      .setTitle("Softcard Bot Commands")
+      .setDescription(HELP_LINES.join("\n"))
+      .setColor(0x62d26f)
+      .setFooter({ text: "Cat care lives under /catcare so the system stays compact." });
     return interaction.reply({
       ephemeral: true,
-      content: [
-        "**Softcard Bot Commands**",
-        "",
-        ...HELP_LINES,
-      ].join("\n"),
+      embeds: [helpEmbed],
     });
   }
 
@@ -948,15 +1062,114 @@ client.on("interactionCreate", async (interaction) => {
 
     const items = getUserItems(user.id);
     const itemTotal = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+    const exploreEmbed = new EmbedBuilder()
+      .setTitle(`${user.username} explored the alleys`)
+      .addFields(
+        { name: "Item found", value: `**${foundItem.name}** [${foundItem.rarity}]`, inline: true },
+        { name: "Cat encounter", value: catLine, inline: false },
+        { name: "Bag", value: `**${itemTotal}** total item${itemTotal === 1 ? "" : "s"}`, inline: true },
+      )
+      .setColor(foundCat ? 0xf5b942 : 0x62d26f);
 
     return interaction.reply({
-      content: [
-        `**${user.username} explored the alleys.**`,
-        `Found item: **${foundItem.name}** [${foundItem.rarity}]`,
-        catLine,
-        `Item bag: **${itemTotal}** total item${itemTotal === 1 ? "" : "s"}.`,
-      ].join("\n"),
+      embeds: [exploreEmbed],
     });
+  }
+
+  if (commandName === "catcare") {
+    const action = options.getSubcommand();
+    let care = normalizedCare(user.id);
+
+    if (action === "favorite") {
+      const catInput = options.getString("cat", true);
+      const cat = findCat(catInput);
+      if (!cat || getUserCatQuantity(user.id, cat.name) <= 0) {
+        return interaction.reply({ content: `You do not own a cat matching "${catInput}".`, ephemeral: true });
+      }
+
+      care = { ...careDefaults(cat.name), level: care.level || 1, xp: care.xp || 0 };
+      saveCare(user.id, care);
+      return interaction.reply({ embeds: [careEmbed(user, care, "Favorite cat selected")], ephemeral: true });
+    }
+
+    if (action === "bag") {
+      const items = getUserItems(user.id);
+      const embed = new EmbedBuilder()
+        .setTitle(`${user.username}'s Explore Bag`)
+        .setDescription(items.length ? items.map((item) => `**${item.name}** x \`${item.quantity}\``).join("\n") : "Your bag is empty. Use `/explore` to find food and upgrade items.")
+        .setColor(0x62d26f);
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    if (!care.favoriteCat || getUserCatQuantity(user.id, care.favoriteCat) <= 0) {
+      return interaction.reply({
+        content: "Pick a favorite cat first with `/catcare favorite cat:<name>`.",
+        ephemeral: true,
+      });
+    }
+
+    if (action === "status") {
+      return interaction.reply({ embeds: [careEmbed(user, care)], ephemeral: true });
+    }
+
+    if (action === "feed") {
+      const requestedFood = options.getString("food") || "Cat Treat";
+      const food = getUserItems(user.id).find((item) => item.name.toLowerCase() === requestedFood.toLowerCase() && CAT_FOOD_ITEMS.has(item.name))
+        || getUserItems(user.id).find((item) => CAT_FOOD_ITEMS.has(item.name));
+      if (!food) {
+        return interaction.reply({ content: "You need food first. Explore for Cat Treats, Fish Snacks, or Ancient Catnip.", ephemeral: true });
+      }
+
+      removeUserItem(user.id, food.name, 1);
+      care.hunger = Math.min(100, Number(care.hunger || 0) + (food.name === "Ancient Catnip" ? 45 : food.name === "Fish Snack" ? 30 : 22));
+      care.happiness = Math.min(100, Number(care.happiness || 0) + 8);
+      care.xp = Number(care.xp || 0) + 5;
+      if (care.xp >= care.level * 25) {
+        care.xp = 0;
+        care.level += 1;
+      }
+      saveCare(user.id, care);
+      return interaction.reply({ embeds: [careEmbed(user, care, `Fed ${care.favoriteCat} with ${food.name}`)], ephemeral: true });
+    }
+
+    if (action === "play") {
+      const toy = getUserItemQuantity(user.id, "Yarn Ball") > 0 ? "Yarn Ball" : getUserItemQuantity(user.id, "Tiny Bell") > 0 ? "Tiny Bell" : "";
+      if (!toy) return interaction.reply({ content: "You need a Yarn Ball or Tiny Bell from `/explore` to play.", ephemeral: true });
+
+      removeUserItem(user.id, toy, 1);
+      care.happiness = Math.min(100, Number(care.happiness || 0) + (toy === "Tiny Bell" ? 32 : 22));
+      care.hunger = Math.max(0, Number(care.hunger || 0) - 6);
+      care.xp = Number(care.xp || 0) + 6;
+      if (care.xp >= care.level * 25) {
+        care.xp = 0;
+        care.level += 1;
+      }
+      saveCare(user.id, care);
+      return interaction.reply({ embeds: [careEmbed(user, care, `Played with ${care.favoriteCat}`)], ephemeral: true });
+    }
+
+    if (action === "upgrade") {
+      const currentCat = catRef(care.favoriteCat);
+      const recipe = currentCat ? CAT_UPGRADE_RECIPES[currentCat.rarity] : null;
+      if (!recipe) return interaction.reply({ embeds: [careEmbed(user, care, "This cat is already max rarity")], ephemeral: true });
+      if (care.hunger < 60 || care.happiness < 60) {
+        return interaction.reply({ content: "Your favorite cat needs at least 60 hunger and 60 happiness before upgrading.", ephemeral: true });
+      }
+      if (!consumeRecipeItems(user.id, recipe)) {
+        return interaction.reply({ embeds: [careEmbed(user, care, "Missing upgrade items")], ephemeral: true });
+      }
+
+      const upgradedCat = randomCatByRarity(recipe.next);
+      removeUserCat(user.id, currentCat.name, 1);
+      addUserCat(user.id, upgradedCat.name, 1);
+      care.favoriteCat = upgradedCat.name;
+      care.hunger = Math.max(35, care.hunger - 25);
+      care.happiness = Math.max(35, care.happiness - 20);
+      care.level += 1;
+      care.xp = 0;
+      saveCare(user.id, care);
+      return interaction.reply({ embeds: [careEmbed(user, care, `${currentCat.name} upgraded into ${upgradedCat.name}`)], ephemeral: true });
+    }
   }
 
   if (commandName === "serversetup") {
