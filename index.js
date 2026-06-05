@@ -29,8 +29,10 @@ if (!token) throw new Error("Missing DISCORD_BOT_TOKEN.");
 if (!secret) throw new Error("Missing SOFTCARD_PRESENCE_SYNC_SECRET.");
 if (!supabaseUrl || !supabaseKey) throw new Error("Missing SUPABASE_URL or SUPABASE_KEY.");
 
-// Initialize Supabase Client
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Initialize Supabase Client with explicitly configured global fetch to prevent container environment errors
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: { persistSession: false }
+});
 
 const activityNames = {
   [ActivityType.Playing]: "Playing",
@@ -155,25 +157,29 @@ async function syncPresence(presence, force = false) {
   if (!force && previous === key) return;
   if (!force && Date.now() - lastSentAt < MIN_SYNC_MS) return;
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${secret}`,
-      "Content-Type": "application/json",
-    },
-    body: key,
-  });
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${secret}`,
+        "Content-Type": "application/json",
+      },
+      body: key,
+    });
 
-  lastSentAtByUser.set(presence.userId, Date.now());
+    lastSentAtByUser.set(presence.userId, Date.now());
 
-  if (response.ok) {
-    lastPayloadByUser.set(presence.userId, key);
-    console.log(`Synced ${presence.userId}: ${payload.status}`);
-    return;
+    if (response.ok) {
+      lastPayloadByUser.set(presence.userId, key);
+      console.log(`Synced ${presence.userId}: ${payload.status}`);
+      return;
+    }
+
+    const body = await response.text().catch(() => "");
+    console.warn(`Softcard sync failed for ${presence.userId}: ${response.status} ${body}`);
+  } catch (err) {
+    console.error(`Failed connecting to presence API endpoint for ${presence.userId}:`, err.message);
   }
-
-  const body = await response.text().catch(() => "");
-  console.warn(`Softcard sync failed for ${presence.userId}: ${response.status} ${body}`);
 }
 
 // --- HELPER FUNCTIONS FOR GAMEPLAY ---
@@ -223,42 +229,50 @@ function loadCustomServerEmojis() {
 // --- SUPABASE DATABASE GET/SET HELPERS ---
 
 async function getServerSetup(guildId) {
-  const { data } = await supabase.from("server_setups").select("*").eq("guild_id", guildId).maybeSingle();
+  const { data, error } = await supabase.from("server_setups").select("*").eq("guild_id", guildId).maybeSingle();
+  if (error) console.error("Database query error [getServerSetup]:", error.message);
   return data;
 }
 
 async function saveServerChannel(guildId, channelId) {
-  await supabase.from("server_setups").upsert({ guild_id: guildId, channel_id: channelId }, { onConflict: "guild_id" });
+  const { error } = await supabase.from("server_setups").upsert({ guild_id: guildId, channel_id: channelId }, { onConflict: "guild_id" });
+  if (error) console.error("Database write error [saveServerChannel]:", error.message);
 }
 
 async function incrementMessageCounter(guildId) {
   const setup = await getServerSetup(guildId);
   const nextCount = (setup?.message_count || 0) + 1;
-  await supabase.from("server_setups").upsert({ guild_id: guildId, message_count: nextCount }, { onConflict: "guild_id" });
+  const { error } = await supabase.from("server_setups").upsert({ guild_id: guildId, message_count: nextCount }, { onConflict: "guild_id" });
+  if (error) console.error("Database write error [incrementMessageCounter]:", error.message);
   return nextCount;
 }
 
 async function resetMessageCounter(guildId) {
-  await supabase.from("server_setups").upsert({ guild_id: guildId, message_count: 0 }, { onConflict: "guild_id" });
+  const { error } = await supabase.from("server_setups").upsert({ guild_id: guildId, message_count: 0 }, { onConflict: "guild_id" });
+  if (error) console.error("Database write error [resetMessageCounter]:", error.message);
 }
 
 async function getUserCatQuantity(userId, catName) {
-  const { data } = await supabase.from("user_storage").select("quantity").eq("user_id", userId).eq("cat_name", catName).maybeSingle();
+  const { data, error } = await supabase.from("user_storage").select("quantity").eq("user_id", userId).eq("cat_name", catName).maybeSingle();
+  if (error) console.error("Database query error [getUserCatQuantity]:", error.message);
   return data ? data.quantity : 0;
 }
 
 async function addUserCat(userId, catName, amount = 1) {
   const currentQuantity = await getUserCatQuantity(userId, catName);
-  await supabase.from("user_storage").upsert({ user_id: userId, cat_name: catName, quantity: currentQuantity + amount }, { onConflict: "user_id,cat_name" });
+  const { error } = await supabase.from("user_storage").upsert({ user_id: userId, cat_name: catName, quantity: currentQuantity + amount }, { onConflict: "user_id,cat_name" });
+  if (error) console.error("Database write error [addUserCat]:", error.message);
 }
 
 async function removeUserCat(userId, catName, amount = 1) {
   const currentQuantity = await getUserCatQuantity(userId, catName);
-  await supabase.from("user_storage").upsert({ user_id: userId, cat_name: catName, quantity: Math.max(0, currentQuantity - amount) }, { onConflict: "user_id,cat_name" });
+  const { error } = await supabase.from("user_storage").upsert({ user_id: userId, cat_name: catName, quantity: Math.max(0, currentQuantity - amount) }, { onConflict: "user_id,cat_name" });
+  if (error) console.error("Database write error [removeUserCat]:", error.message);
 }
 
 async function getUserInventory(userId) {
-  const { data } = await supabase.from("user_storage").select("cat_name, quantity").eq("user_id", userId).gt("quantity", 0);
+  const { data, error } = await supabase.from("user_storage").select("cat_name, quantity").eq("user_id", userId).gt("quantity", 0);
+  if (error) console.error("Database query error [getUserInventory]:", error.message);
   return data || [];
 }
 
@@ -298,13 +312,17 @@ client.once("ready", async () => {
 
   // Trigger timed loops every 10 minutes
   setInterval(async () => {
-    const { data: rows } = await supabase.from("server_setups").select("guild_id, channel_id").not("channel_id", "is", null);
-    if (!rows) return;
-    for (const row of rows) {
-      const guild = client.guilds.cache.get(row.guild_id);
-      if (guild && row.channel_id) {
-        triggerCatDrop(guild, row.channel_id).catch(console.error);
+    try {
+      const { data: rows } = await supabase.from("server_setups").select("guild_id, channel_id").not("channel_id", "is", null);
+      if (!rows) return;
+      for (const row of rows) {
+        const guild = client.guilds.cache.get(row.guild_id);
+        if (guild && row.channel_id) {
+          triggerCatDrop(guild, row.channel_id).catch(console.error);
+        }
       }
+    } catch (err) {
+      console.error("Error in drop interval loop:", err.message);
     }
   }, 600_000); 
 });
@@ -369,9 +387,10 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (commandName === "catstorage") {
+    await interaction.deferReply({ ephemeral: true });
     const items = await getUserInventory(user.id);
 
-    if (items.length === 0) return interaction.reply({ content: "📦 **Your Cat Storage vault is empty!**", ephemeral: true });
+    if (items.length === 0) return interaction.editReply({ content: "📦 **Your Cat Storage vault is empty!**" });
 
     let responseText = `📬 ▬▬ **${user.username.toUpperCase()}'S CAT VAULT** ▬▬ 📬\n\n`;
     for (const item of items) {
@@ -380,7 +399,7 @@ client.on("interactionCreate", async (interaction) => {
     }
     responseText += `\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`;
 
-    return interaction.reply({ content: responseText });
+    return interaction.editReply({ content: responseText });
   }
 
   if (commandName === "trade") {
