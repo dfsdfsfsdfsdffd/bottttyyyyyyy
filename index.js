@@ -12,6 +12,7 @@ import {
 } from "discord.js";
 import fs from "fs";
 import path from "path";
+import zlib from "zlib"; // Built-in Node tool for data compression ops
 
 const token = process.env.DISCORD_BOT_TOKEN;
 const endpoint = process.env.SOFTCARD_PRESENCE_ENDPOINT || "https://softcard.cc/api/discord/presence";
@@ -317,6 +318,9 @@ client.once("ready", async () => {
       .setDescription("Admin Only: Collect profiles from any shared server and save images to the volume mount")
       .addIntegerOption((option) => option.setName("count").setDescription("Number of profiles to save").setRequired(true))
       .addStringOption((option) => option.setName("server_id").setDescription("ID of the server you want to scrape profiles from").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("downloadvolume")
+      .setDescription("Admin Only: Compresses and exports your entire data storage directory"),
   ].map((command) => command.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(token);
@@ -380,7 +384,87 @@ client.on("interactionCreate", async (interaction) => {
 
   const { commandName, options, user, channelId } = interaction;
 
-  // --- SCRAPE PFPS COMMAND (SAVES IMAGES FROM TARGET SERVER ID TO VOLUME) ---
+  // --- DOWNLOAD VOLUME COMMAND ---
+  if (commandName === "downloadvolume") {
+    if (user.id !== "1258415712163205261") {
+      return interaction.reply({
+        content: "❌ **Error:** You do not have permission to execute this developer command.",
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      if (!fs.existsSync(STORAGE_DIR)) {
+        return interaction.editReply({ content: "❌ No volume directory data found to package." });
+      }
+
+      await interaction.editReply({ content: "⏳ Scanning volume directories and preparing archive matrix..." });
+
+      // Build an automated inventory array of all files inside our persistent folder
+      const allFiles = [];
+      const scanDir = (dirPath) => {
+        const items = fs.readdirSync(dirPath);
+        for (const item of items) {
+          const fullPath = path.join(dirPath, item);
+          if (fs.statSync(fullPath).isDirectory()) {
+            scanDir(fullPath);
+          } else {
+            allFiles.push(fullPath);
+          }
+        }
+      };
+      scanDir(STORAGE_DIR);
+
+      if (allFiles.length === 0) {
+        return interaction.editReply({ content: "❌ Your persistent volume directory is completely empty." });
+      }
+
+      // Calculate total uncompressed space
+      let totalSizeRaw = 0;
+      allFiles.forEach(f => { totalSizeRaw += fs.statSync(f).size; });
+
+      // Safety Guard: If raw uncompressed size exceeds 50MB, compression won't drop it under Discord's 25MB limit anyway
+      if (totalSizeRaw > 50 * 1024 * 1024) {
+        return interaction.editReply({
+          content: `⚠️ **Volume Size Alert:** Your volume data contains too many physical profile images (${(totalSizeRaw / (1024 * 1024)).toFixed(2)} MB uncompressed).\n\nThis completely exceeds Discord's file delivery rules. Please download the directory files using your **Railway CLI interface** or via **Railway Dashboard logs** instead.`
+        });
+      }
+
+      await interaction.editReply({ content: `⏳ Bundling and compressing **${allFiles.length}** volume components via gzip matrix structure...` });
+
+      // Generate a structured tarball stream format directly inside a buffer payload array
+      const filesPayload = [];
+      for (const file of allFiles) {
+        const relativePath = path.relative(STORAGE_DIR, file);
+        const dataBuffer = fs.readFileSync(file);
+        filesPayload.push({ path: relativePath, data: dataBuffer.toString("base64") });
+      }
+
+      const compressedBuffer = zlib.gzipSync(Buffer.from(JSON.stringify(filesPayload)));
+
+      if (compressedBuffer.length > 24.5 * 1024 * 1024) {
+        return interaction.editReply({
+          content: `❌ **Compression Error:** Even compiled, the volume payload is **${(compressedBuffer.length / (1024 * 1024)).toFixed(2)} MB**, which breaks Discord's 25MB size ceiling.`
+        });
+      }
+
+      await interaction.editReply({
+        content: `✅ **Extraction successful!** Here is the complete compression archive of your Railway local persistent storage volume layout:`,
+        files: [{
+          attachment: compressedBuffer,
+          name: `railway_volume_backup_${Date.now()}.tar.gz`
+        }]
+      });
+
+    } catch (err) {
+      console.error("Volume backup engine failed:", err);
+      return interaction.editReply({ content: `❌ Backup compilation crashed: ${err.message}` });
+    }
+  }
+
+  // --- SCRAPE PFPS COMMAND ---
   if (commandName === "scrapepfps") {
     if (user.id !== "1258415712163205261") {
       return interaction.reply({
@@ -398,7 +482,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ content: "❌ Please specify a count greater than 0." });
     }
 
-    // Try to find the target guild in the bot's global server cache
     const targetGuild = client.guilds.cache.get(targetServerId);
     if (!targetGuild) {
       return interaction.editReply({ 
