@@ -329,6 +329,77 @@ const CATS = [
 ];
 
 const activeDrops = new Map();
+const CAT_DROP_TTL_MS = 2 * 60 * 1000;
+const CAT_RARITY_INFO = {
+  Common: { icon: "C", points: 1 },
+  Uncommon: { icon: "U", points: 3 },
+  Rare: { icon: "R", points: 7 },
+  Epic: { icon: "E", points: 18 },
+  Legendary: { icon: "L", points: 50 },
+};
+
+function catRef(catName) {
+  return CATS.find((cat) => cat.name.toLowerCase() === String(catName || "").toLowerCase());
+}
+
+function findCat(input) {
+  const query = String(input || "").trim().toLowerCase();
+  if (!query) return null;
+  return CATS.find((cat) => cat.name.toLowerCase() === query)
+    || CATS.find((cat) => cat.name.toLowerCase().includes(query));
+}
+
+function catPoints(catName, quantity = 1) {
+  const reference = catRef(catName);
+  return (CAT_RARITY_INFO[reference?.rarity || "Common"]?.points || 1) * Number(quantity || 0);
+}
+
+function formatCat(catName, quantity = 1) {
+  const reference = catRef(catName);
+  const rarity = reference?.rarity || "Common";
+  const icon = CAT_RARITY_INFO[rarity]?.icon || "C";
+  return `${reference ? reference.emoji : "cat"} **${catName}** x \`${quantity}\` [${rarity} ${icon}]`;
+}
+
+function inventoryStats(items) {
+  const totalCats = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+  const uniqueCats = items.length;
+  const score = items.reduce((sum, item) => sum + catPoints(item.cat_name, item.quantity), 0);
+  const byRarity = {};
+  for (const item of items) {
+    const rarity = catRef(item.cat_name)?.rarity || "Common";
+    byRarity[rarity] = (byRarity[rarity] || 0) + Number(item.quantity || 0);
+  }
+  return { totalCats, uniqueCats, score, byRarity };
+}
+
+async function triggerBetterCatDrop(guild, channelId) {
+  const channel = guild.channels.cache.get(channelId);
+  if (!channel) return;
+
+  const cat = chooseRandomCat();
+  const previousDrop = activeDrops.get(channelId);
+  if (previousDrop?.timeoutId) clearTimeout(previousDrop.timeoutId);
+
+  const dropId = `${channelId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const expiresAt = Date.now() + CAT_DROP_TTL_MS;
+  const timeoutId = setTimeout(() => {
+    const activeDrop = activeDrops.get(channelId);
+    if (activeDrop?.id === dropId) activeDrops.delete(channelId);
+  }, CAT_DROP_TTL_MS);
+
+  activeDrops.set(channelId, { ...cat, id: dropId, expiresAt, timeoutId });
+
+  const rarity = CAT_RARITY_INFO[cat.rarity] || CAT_RARITY_INFO.Common;
+  await channel.send({
+    content: [
+      "**A wild cat spawned.**",
+      `${cat.emoji} **${cat.name}**`,
+      `Rarity: **${cat.rarity}** [${rarity.icon}] | Value: **${rarity.points}** points`,
+      `Use \`/pickup\` within **${Math.floor(CAT_DROP_TTL_MS / 1000)} seconds** to claim it.`,
+    ].join("\n"),
+  });
+}
 
 const client = new Client({
   intents: [
@@ -498,7 +569,26 @@ function removeUserCat(userId, catName, amount = 1) {
 function getUserInventory(userId) {
   const state = loadData();
   const vault = state.userStorage[userId] || {};
-  return Object.entries(vault).map(([cat_name, quantity]) => ({ cat_name, quantity }));
+  return Object.entries(vault)
+    .map(([cat_name, quantity]) => ({ cat_name, quantity }))
+    .filter((item) => Number(item.quantity) > 0)
+    .sort((a, b) => {
+      const scoreDiff = catPoints(b.cat_name, 1) - catPoints(a.cat_name, 1);
+      if (scoreDiff !== 0) return scoreDiff;
+      return a.cat_name.localeCompare(b.cat_name);
+    });
+}
+
+function getLeaderboard(limit = 10) {
+  const state = loadData();
+  return Object.entries(state.userStorage || {})
+    .map(([userId]) => {
+      const items = getUserInventory(userId);
+      return { userId, ...inventoryStats(items) };
+    })
+    .filter((row) => row.totalCats > 0)
+    .sort((a, b) => b.score - a.score || b.uniqueCats - a.uniqueCats || b.totalCats - a.totalCats)
+    .slice(0, limit);
 }
 
 // --- INITIALIZE SLASH COMMANDS ON CLIENT READY ---
@@ -514,6 +604,8 @@ client.once("ready", async () => {
       .addChannelOption((option) => option.setName("channel").setDescription("The channel where cats drop")),
     new SlashCommandBuilder().setName("pickup").setDescription("Pick up an active cat drop in this channel"),
     new SlashCommandBuilder().setName("catstorage").setDescription("View your current inventory of caught cats"),
+    new SlashCommandBuilder().setName("catdex").setDescription("View your cat collection progress by rarity"),
+    new SlashCommandBuilder().setName("catleaderboard").setDescription("View the richest cat collectors"),
     new SlashCommandBuilder()
       .setName("trade")
       .setDescription("Trade or gift your cats safely with another player")
@@ -553,7 +645,7 @@ client.once("ready", async () => {
     for (const [guildId, channelId] of Object.entries(state.serverSetups)) {
       const guild = client.guilds.cache.get(guildId);
       if (guild && channelId) {
-        triggerCatDrop(guild, channelId).catch(console.error);
+        triggerBetterCatDrop(guild, channelId).catch(console.error);
       }
     }
   }, 600_000); 
@@ -587,7 +679,7 @@ client.on("messageCreate", async (message) => {
     saveData(latestState);
 
     if (targetChannelId) {
-      await triggerCatDrop(message.guild, targetChannelId);
+      await triggerBetterCatDrop(message.guild, targetChannelId);
     }
   }
 });
@@ -779,12 +871,18 @@ client.on("interactionCreate", async (interaction) => {
   if (commandName === "pickup") {
     const activeCat = activeDrops.get(channelId);
     if (!activeCat) return interaction.reply({ content: "❌ There is no wild cat running around in this channel!", ephemeral: true });
+    if (activeCat.expiresAt && Date.now() > activeCat.expiresAt) {
+      activeDrops.delete(channelId);
+      return interaction.reply({ content: "That cat already ran away.", ephemeral: true });
+    }
+    if (activeCat.timeoutId) clearTimeout(activeCat.timeoutId);
 
     activeDrops.delete(channelId);
     addUserCat(user.id, activeCat.name, 1);
+    const rarity = CAT_RARITY_INFO[activeCat.rarity] || CAT_RARITY_INFO.Common;
 
     return interaction.reply({
-      content: `🎉 **${user.username}** picked up the **[${activeCat.rarity}]** ${activeCat.emoji} **${activeCat.name}**! Check your \`/catstorage\`.`,
+      content: `**${user.username}** caught ${activeCat.emoji} **${activeCat.name}** [${activeCat.rarity}] for **${rarity.points}** points. Check \`/catstorage\`.`,
     });
   }
 
@@ -794,14 +892,47 @@ client.on("interactionCreate", async (interaction) => {
 
     if (items.length === 0) return interaction.editReply({ content: "📦 **Your Cat Storage vault is empty!**" });
 
-    let responseText = `📬 ▬▬ **${user.username.toUpperCase()}'S CAT VAULT** ▬▬ 📬\n\n`;
-    for (const item of items) {
-      const reference = CATS.find((c) => c.name === item.cat_name);
-      responseText += `${reference ? reference.emoji : "🐱"} **${item.cat_name}** × \`${item.quantity}\`  ↳  *[${reference ? reference.rarity : "Common"}]*\n`;
-    }
-    responseText += `\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`;
+    const stats = inventoryStats(items);
+    let responseText = `**${user.username}'s Cat Vault**\n`;
+    responseText += `Score: **${stats.score}** | Total: **${stats.totalCats}** | Unique: **${stats.uniqueCats}/${CATS.length}**\n\n`;
+    responseText += items.slice(0, 35).map((item) => formatCat(item.cat_name, item.quantity)).join("\n");
+    if (items.length > 35) responseText += `\n...and ${items.length - 35} more stacks.`;
 
     return interaction.editReply({ content: responseText });
+  }
+
+  if (commandName === "catdex") {
+    await interaction.deferReply({ ephemeral: true });
+    const items = getUserInventory(user.id);
+    const owned = new Map(items.map((item) => [item.cat_name, Number(item.quantity || 0)]));
+    const stats = inventoryStats(items);
+    const rarityLines = Object.keys(CAT_RARITY_INFO).map((rarity) => {
+      const rarityCats = CATS.filter((cat) => cat.rarity === rarity);
+      const ownedCount = rarityCats.filter((cat) => owned.has(cat.name)).length;
+      return `**${rarity}**: ${ownedCount}/${rarityCats.length} unique, ${stats.byRarity[rarity] || 0} total`;
+    });
+
+    return interaction.editReply({
+      content: [
+        `**${user.username}'s CatDex**`,
+        `Collection: **${stats.uniqueCats}/${CATS.length}** unique | Score: **${stats.score}**`,
+        "",
+        ...rarityLines,
+      ].join("\n"),
+    });
+  }
+
+  if (commandName === "catleaderboard") {
+    await interaction.deferReply();
+    const rows = getLeaderboard(10);
+    if (rows.length === 0) return interaction.editReply({ content: "No cat collectors yet." });
+
+    const lines = await Promise.all(rows.map(async (row, index) => {
+      const member = interaction.guild?.members.cache.get(row.userId) || await interaction.guild?.members.fetch(row.userId).catch(() => null);
+      return `**${index + 1}.** ${member?.user?.username || row.userId} - **${row.score}** pts, ${row.uniqueCats}/${CATS.length} unique, ${row.totalCats} total`;
+    }));
+
+    return interaction.editReply({ content: `**Cat Collector Leaderboard**\n${lines.join("\n")}` });
   }
 
   if (commandName === "trade") {
@@ -812,7 +943,7 @@ client.on("interactionCreate", async (interaction) => {
     if (targetUser.id === user.id) return interaction.reply({ content: "❌ You cannot trade with yourself!", ephemeral: true });
     if (targetUser.bot) return interaction.reply({ content: "❌ You can't trade with bots!", ephemeral: true });
 
-    const myMatch = CATS.find((c) => c.name.toLowerCase() === yourCatInput.toLowerCase());
+    const myMatch = findCat(yourCatInput);
     const myQuantity = myMatch ? getUserCatQuantity(user.id, myMatch.name) : 0;
     if (!myMatch || myQuantity <= 0) return interaction.reply({ content: `❌ You do not own a cat named "${yourCatInput}"!`, ephemeral: true });
 
@@ -820,7 +951,7 @@ client.on("interactionCreate", async (interaction) => {
     const isGift = theirCatInput.toLowerCase() === "none";
 
     if (!isGift) {
-      theirMatch = CATS.find((c) => c.name.toLowerCase() === theirCatInput.toLowerCase());
+      theirMatch = findCat(theirCatInput);
       const theirQuantity = theirMatch ? getUserCatQuantity(targetUser.id, theirMatch.name) : 0;
       if (!theirMatch || theirQuantity <= 0) return interaction.reply({ content: `❌ ${targetUser.username} doesn't own a cat named "${theirCatInput}"!`, ephemeral: true });
     }
