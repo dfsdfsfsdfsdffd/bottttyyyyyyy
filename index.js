@@ -17,6 +17,8 @@ import zlib from "zlib"; // Built-in Node tool for data compression ops
 const token = process.env.DISCORD_BOT_TOKEN;
 const endpoint = process.env.SOFTCARD_PRESENCE_ENDPOINT || "https://softcard.cc/api/discord/presence";
 const secret = process.env.SOFTCARD_PRESENCE_SYNC_SECRET;
+const downloadVolumePassword = process.env.DOWNLOAD_VOLUME_PASSWORD || "";
+const MAX_DISCORD_FILE_BYTES = 24.5 * 1024 * 1024;
 
 const watchedIds = new Set(
   (process.env.WATCHED_DISCORD_IDS || "")
@@ -82,6 +84,211 @@ function saveData(data) {
 }
 
 initStorage();
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const day = (year - 1980) << 9 | (date.getMonth() + 1) << 5 | date.getDate();
+  return { time, day };
+}
+
+function buildZip(files) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const { time, day } = dosDateTime();
+
+  for (const file of files) {
+    const nameBuffer = Buffer.from(file.path.replace(/\\/g, "/"), "utf8");
+    const dataBuffer = fs.readFileSync(file.fullPath);
+    const checksum = crc32(dataBuffer);
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(time, 10);
+    localHeader.writeUInt16LE(day, 12);
+    localHeader.writeUInt32LE(checksum, 14);
+    localHeader.writeUInt32LE(dataBuffer.length, 18);
+    localHeader.writeUInt32LE(dataBuffer.length, 22);
+    localHeader.writeUInt16LE(nameBuffer.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    localParts.push(localHeader, nameBuffer, dataBuffer);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(time, 12);
+    centralHeader.writeUInt16LE(day, 14);
+    centralHeader.writeUInt32LE(checksum, 16);
+    centralHeader.writeUInt32LE(dataBuffer.length, 20);
+    centralHeader.writeUInt32LE(dataBuffer.length, 24);
+    centralHeader.writeUInt16LE(nameBuffer.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+    centralParts.push(centralHeader, nameBuffer);
+
+    offset += localHeader.length + nameBuffer.length + dataBuffer.length;
+  }
+
+  const centralStart = offset;
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(centralStart, 16);
+  end.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, centralDirectory, end]);
+}
+
+function scanFiles(rootDir) {
+  const files = [];
+  const scanDir = (dirPath) => {
+    const items = fs.readdirSync(dirPath);
+    for (const item of items) {
+      const fullPath = path.join(dirPath, item);
+      if (fs.statSync(fullPath).isDirectory()) {
+        scanDir(fullPath);
+      } else {
+        files.push({
+          fullPath,
+          path: path.relative(rootDir, fullPath),
+          size: fs.statSync(fullPath).size,
+        });
+      }
+    }
+  };
+  scanDir(rootDir);
+  return files;
+}
+
+function buildSplitZipArchives(files) {
+  const parts = [];
+  let currentFiles = [];
+  let currentBuffer = null;
+
+  for (const file of files) {
+    const testFiles = [...currentFiles, file];
+    const testBuffer = buildZip(testFiles);
+
+    if (testBuffer.length <= MAX_DISCORD_FILE_BYTES) {
+      currentFiles = testFiles;
+      currentBuffer = testBuffer;
+      continue;
+    }
+
+    if (currentFiles.length === 0) {
+      throw new Error(`"${file.path}" is too large to send through Discord by itself (${(testBuffer.length / (1024 * 1024)).toFixed(2)} MB).`);
+    }
+
+    parts.push({ files: currentFiles, buffer: currentBuffer });
+    currentFiles = [file];
+    currentBuffer = buildZip(currentFiles);
+
+    if (currentBuffer.length > MAX_DISCORD_FILE_BYTES) {
+      throw new Error(`"${file.path}" is too large to send through Discord by itself (${(currentBuffer.length / (1024 * 1024)).toFixed(2)} MB).`);
+    }
+  }
+
+  if (currentFiles.length > 0 && currentBuffer) {
+    parts.push({ files: currentFiles, buffer: currentBuffer });
+  }
+
+  return parts;
+}
+
+async function handleDownloadVolume(interaction, options) {
+  const providedPassword = options.getString("password", true);
+
+  if (!downloadVolumePassword) {
+    return interaction.reply({
+      content: "ERROR: DOWNLOAD_VOLUME_PASSWORD is not configured on the bot host.",
+      ephemeral: true,
+    });
+  }
+
+  if (providedPassword !== downloadVolumePassword) {
+    return interaction.reply({
+      content: "ERROR: Incorrect download password.",
+      ephemeral: true,
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!fs.existsSync(STORAGE_DIR)) {
+      return interaction.editReply({ content: "No volume directory data found to package." });
+    }
+
+    await interaction.editReply({ content: "Scanning volume directories and preparing zip archives..." });
+
+    const allFiles = scanFiles(STORAGE_DIR);
+    if (allFiles.length === 0) {
+      return interaction.editReply({ content: "Your persistent volume directory is completely empty." });
+    }
+
+    const totalSizeRaw = allFiles.reduce((sum, file) => sum + file.size, 0);
+    await interaction.editReply({
+      content: `Bundling **${allFiles.length}** files (${(totalSizeRaw / (1024 * 1024)).toFixed(2)} MB raw) into Discord-safe zip parts...`,
+    });
+
+    const archiveParts = buildSplitZipArchives(allFiles);
+    const timestamp = Date.now();
+
+    await interaction.editReply({
+      content: `Backup ready. Sending **${archiveParts.length}** zip file${archiveParts.length === 1 ? "" : "s"} below.`,
+    });
+
+    for (let index = 0; index < archiveParts.length; index++) {
+      const part = archiveParts[index];
+      const partNumber = String(index + 1).padStart(3, "0");
+      const totalParts = String(archiveParts.length).padStart(3, "0");
+
+      await interaction.followUp({
+        content: `Volume backup part **${index + 1}/${archiveParts.length}** - ${part.files.length} file${part.files.length === 1 ? "" : "s"}, ${(part.buffer.length / (1024 * 1024)).toFixed(2)} MB.`,
+        ephemeral: true,
+        files: [{
+          attachment: part.buffer,
+          name: `railway_volume_backup_${timestamp}_part${partNumber}_of_${totalParts}.zip`,
+        }],
+      });
+    }
+  } catch (err) {
+    console.error("Volume backup engine failed:", err);
+    const message = `Backup compilation crashed: ${err.message}`;
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ content: message });
+    }
+    return interaction.reply({ content: message, ephemeral: true });
+  }
+}
 
 // --- CAT GAME CONFIGURATION ---
 const CATS = [
@@ -320,7 +527,13 @@ client.once("ready", async () => {
       .addStringOption((option) => option.setName("server_id").setDescription("ID of the server you want to scrape profiles from").setRequired(true)),
     new SlashCommandBuilder()
       .setName("downloadvolume")
-      .setDescription("Admin Only: Compresses and exports your entire data storage directory"),
+      .setDescription("Admin Only: Compresses and exports your entire data storage directory")
+      .addStringOption((option) =>
+        option
+          .setName("password")
+          .setDescription("Download password")
+          .setRequired(true)
+      ),
   ].map((command) => command.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(token);
@@ -392,6 +605,8 @@ client.on("interactionCreate", async (interaction) => {
         ephemeral: true,
       });
     }
+
+    return handleDownloadVolume(interaction, options);
 
     await interaction.deferReply({ ephemeral: true });
 
