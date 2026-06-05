@@ -86,6 +86,17 @@ function buildPayload(presence) {
   };
 }
 
+function syncCachedPresences(force = false) {
+  let count = 0;
+  for (const guild of client.guilds.cache.values()) {
+    for (const presence of guild.presences.cache.values()) {
+      count += 1;
+      syncPresence(presence, force).catch((error) => console.warn(error));
+    }
+  }
+  return count;
+}
+
 async function syncPresence(presence, force = false) {
   if (!presence?.userId) return;
   if (watchedIds.size > 0 && !watchedIds.has(presence.userId)) return;
@@ -116,23 +127,34 @@ async function syncPresence(presence, force = false) {
   }
 
   const body = await response.text().catch(() => "");
-  if (response.status !== 404) {
-    console.warn(`Softcard sync failed for ${presence.userId}: ${response.status} ${body}`);
-  }
+  console.warn(`Softcard sync failed for ${presence.userId}: ${response.status} ${body}`);
 }
 
 client.once("ready", async () => {
   console.log(`Softcard presence bot online as ${client.user.tag}`);
+  console.log(watchedIds.size > 0 ? `Watching ${watchedIds.size} configured Discord user IDs.` : "WATCHED_DISCORD_IDS is empty, syncing every visible presence.");
+  console.log(`Initial cached presences: ${syncCachedPresences(true)}`);
 
-  for (const guild of client.guilds.cache.values()) {
-    for (const presence of guild.presences.cache.values()) {
-      syncPresence(presence, true).catch((error) => console.warn(error));
-    }
-  }
+  setInterval(() => {
+    const count = syncCachedPresences(false);
+    console.log(`Presence sweep checked ${count} cached presences.`);
+  }, 60_000);
 });
 
 client.on("presenceUpdate", (_, newPresence) => {
   syncPresence(newPresence).catch((error) => console.warn(error));
+});
+
+client.on("guildMemberAdd", (member) => {
+  if (watchedIds.size > 0 && !watchedIds.has(member.id)) return;
+  setTimeout(() => {
+    const presence = member.presence || member.guild.presences.cache.get(member.id);
+    if (presence) {
+      syncPresence(presence, true).catch((error) => console.warn(error));
+    } else {
+      console.log(`Member ${member.id} joined ${member.guild.name}, but Discord has not sent a presence for them yet.`);
+    }
+  }, 2_500);
 });
 
 client.on("error", (error) => console.error("Discord client error:", error));
