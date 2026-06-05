@@ -46,6 +46,7 @@ const MIN_SYNC_MS = 15_000;
 const STORAGE_DIR = "./data";
 const STORAGE_FILE = path.join(STORAGE_DIR, "storage.json");
 const PFP_OUTPUT_DIR = path.join(STORAGE_DIR, "scraped_pfps");
+const DEFAULT_STORAGE = { serverSetups: {}, serverMessageCounters: {}, userStorage: {}, userItems: {}, exploreCooldowns: {} };
 
 function initStorage() {
   try {
@@ -56,7 +57,7 @@ function initStorage() {
       fs.mkdirSync(PFP_OUTPUT_DIR, { recursive: true });
     }
     if (!fs.existsSync(STORAGE_FILE)) {
-      fs.writeFileSync(STORAGE_FILE, JSON.stringify({ serverSetups: {}, serverMessageCounters: {}, userStorage: {} }, null, 2), "utf8");
+      fs.writeFileSync(STORAGE_FILE, JSON.stringify(DEFAULT_STORAGE, null, 2), "utf8");
     }
   } catch (error) {
     console.error("Failed to initialize storage folders:", error);
@@ -67,12 +68,12 @@ function loadData() {
   try {
     if (fs.existsSync(STORAGE_FILE)) {
       const data = fs.readFileSync(STORAGE_FILE, "utf8");
-      return JSON.parse(data);
+      return { ...DEFAULT_STORAGE, ...JSON.parse(data) };
     }
   } catch (error) {
     console.error("Error reading data from storage file, returning safe defaults:", error);
   }
-  return { serverSetups: {}, serverMessageCounters: {}, userStorage: {} };
+  return { ...DEFAULT_STORAGE };
 }
 
 function saveData(data) {
@@ -337,6 +338,28 @@ const CAT_RARITY_INFO = {
   Epic: { icon: "E", points: 18 },
   Legendary: { icon: "L", points: 50 },
 };
+const EXPLORE_COOLDOWN_MS = 4 * 60 * 1000;
+const EXPLORE_ITEMS = [
+  { name: "Yarn Ball", rarity: "Common", weight: 45, points: 1 },
+  { name: "Cat Treat", rarity: "Common", weight: 40, points: 1 },
+  { name: "Scratched Coin", rarity: "Uncommon", weight: 22, points: 3 },
+  { name: "Tiny Bell", rarity: "Uncommon", weight: 18, points: 3 },
+  { name: "Moon Whisker", rarity: "Rare", weight: 9, points: 8 },
+  { name: "Golden Paw", rarity: "Epic", weight: 4, points: 20 },
+  { name: "Ancient Catnip", rarity: "Legendary", weight: 1, points: 60 },
+];
+const HELP_LINES = [
+  "`/help` - Show every command and what it does.",
+  "`/serversetup [channel]` - Set the channel where wild cats spawn.",
+  "`/pickup` - Claim the active wild cat in the current channel.",
+  "`/explore` - Search for items with a chance to find a cat.",
+  "`/catstorage` - View your cat vault, score, total cats, and unique cats.",
+  "`/catdex` - View collection progress by rarity.",
+  "`/catleaderboard` - Show the top cat collectors.",
+  "`/trade` - Trade a cat or gift one to another user.",
+  "`/scrapepfps` - Admin: save profile pictures from a shared server.",
+  "`/downloadvolume` - Admin: download storage backups with a password.",
+];
 
 function catRef(catName) {
   return CATS.find((cat) => cat.name.toLowerCase() === String(catName || "").toLowerCase());
@@ -371,6 +394,44 @@ function inventoryStats(items) {
     byRarity[rarity] = (byRarity[rarity] || 0) + Number(item.quantity || 0);
   }
   return { totalCats, uniqueCats, score, byRarity };
+}
+
+function chooseWeighted(items) {
+  const totalWeight = items.reduce((sum, item) => sum + item.weight, 0);
+  let random = Math.random() * totalWeight;
+  for (const item of items) {
+    if (random < item.weight) return item;
+    random -= item.weight;
+  }
+  return items[0];
+}
+
+function addUserItem(userId, itemName, amount = 1) {
+  const state = loadData();
+  if (!state.userItems[userId]) state.userItems[userId] = {};
+  state.userItems[userId][itemName] = (state.userItems[userId][itemName] || 0) + amount;
+  saveData(state);
+}
+
+function getUserItems(userId) {
+  const state = loadData();
+  const bag = state.userItems[userId] || {};
+  return Object.entries(bag)
+    .map(([name, quantity]) => ({ name, quantity }))
+    .filter((item) => Number(item.quantity) > 0)
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
+function getExploreCooldown(userId) {
+  const state = loadData();
+  const readyAt = Number(state.exploreCooldowns[userId] || 0);
+  return Math.max(0, readyAt - Date.now());
+}
+
+function setExploreCooldown(userId) {
+  const state = loadData();
+  state.exploreCooldowns[userId] = Date.now() + EXPLORE_COOLDOWN_MS;
+  saveData(state);
 }
 
 async function triggerBetterCatDrop(guild, channelId) {
@@ -598,11 +659,13 @@ client.once("ready", async () => {
   console.log(`Initial cached presences: ${syncCachedPresences(true)}`);
 
   const commands = [
+    new SlashCommandBuilder().setName("help").setDescription("Show all bot commands and what they do"),
     new SlashCommandBuilder()
       .setName("serversetup")
       .setDescription("Configure the spawn channel for cats")
       .addChannelOption((option) => option.setName("channel").setDescription("The channel where cats drop")),
     new SlashCommandBuilder().setName("pickup").setDescription("Pick up an active cat drop in this channel"),
+    new SlashCommandBuilder().setName("explore").setDescription("Explore for items and maybe find a cat"),
     new SlashCommandBuilder().setName("catstorage").setDescription("View your current inventory of caught cats"),
     new SlashCommandBuilder().setName("catdex").setDescription("View your cat collection progress by rarity"),
     new SlashCommandBuilder().setName("catleaderboard").setDescription("View the richest cat collectors"),
@@ -849,6 +912,53 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // --- PRE-EXISTING COMMANDS ---
+  if (commandName === "help") {
+    return interaction.reply({
+      ephemeral: true,
+      content: [
+        "**Softcard Bot Commands**",
+        "",
+        ...HELP_LINES,
+      ].join("\n"),
+    });
+  }
+
+  if (commandName === "explore") {
+    const remainingMs = getExploreCooldown(user.id);
+    if (remainingMs > 0) {
+      const remainingSeconds = Math.ceil(remainingMs / 1000);
+      return interaction.reply({
+        content: `You need to rest before exploring again. Try in **${Math.ceil(remainingSeconds / 60)}m ${remainingSeconds % 60}s**.`,
+        ephemeral: true,
+      });
+    }
+
+    setExploreCooldown(user.id);
+    const foundItem = chooseWeighted(EXPLORE_ITEMS);
+    addUserItem(user.id, foundItem.name, 1);
+
+    const foundCat = Math.random() < 0.18;
+    let catLine = "No cat followed you home this time.";
+    if (foundCat) {
+      const cat = chooseRandomCat();
+      addUserCat(user.id, cat.name, 1);
+      const rarity = CAT_RARITY_INFO[cat.rarity] || CAT_RARITY_INFO.Common;
+      catLine = `A cat appeared too: ${cat.emoji} **${cat.name}** [${cat.rarity}] worth **${rarity.points}** points.`;
+    }
+
+    const items = getUserItems(user.id);
+    const itemTotal = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+
+    return interaction.reply({
+      content: [
+        `**${user.username} explored the alleys.**`,
+        `Found item: **${foundItem.name}** [${foundItem.rarity}]`,
+        catLine,
+        `Item bag: **${itemTotal}** total item${itemTotal === 1 ? "" : "s"}.`,
+      ].join("\n"),
+    });
+  }
+
   if (commandName === "serversetup") {
     const guild = interaction.guild;
     if (!guild) return interaction.reply({ content: "❌ This command must be used within a server.", ephemeral: true });
