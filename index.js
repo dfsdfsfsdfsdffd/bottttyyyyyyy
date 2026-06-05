@@ -6,7 +6,11 @@ import {
   REST,
   Routes,
   SlashCommandBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } from "discord.js";
+import Database from "better-sqlite3";
 
 const token = process.env.DISCORD_BOT_TOKEN;
 const endpoint = process.env.SOFTCARD_PRESENCE_ENDPOINT || "https://softcard.cc/api/discord/presence";
@@ -32,6 +36,28 @@ const activityNames = {
 const lastPayloadByUser = new Map();
 const lastSentAtByUser = new Map();
 const MIN_SYNC_MS = 15_000;
+
+// --- PERSISTENT SQLITE DATABASE SETUP ---
+
+const db = new Database("cats.db");
+
+// Initialize tables if they don't exist
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS server_setups (
+    guild_id TEXT PRIMARY KEY,
+    channel_id TEXT,
+    message_count INTEGER DEFAULT 0
+  )
+`).run();
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS user_storage (
+    user_id TEXT,
+    cat_name TEXT,
+    quantity INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, cat_name)
+  )
+`).run();
 
 // --- CAT GAME DATABASE & CONFIGURATION ---
 
@@ -77,11 +103,7 @@ const CATS = [
   { name: "Suscat", searchName: "8Suscat", emoji: "🐱", rarity: "Legendary", weight: 2 }
 ];
 
-// State storage variables
-const serverSetups = new Map(); // guildId -> channelId
-const messageCounters = new Map(); // guildId -> count
-const activeDrops = new Map(); // channelId -> active dropped cat object
-const userStorage = new Map(); // userId -> { catName: quantity }
+const activeDrops = new Map(); // channelId -> active dropped cat object (restarts safely clear transient wild triggers)
 
 const client = new Client({
   intents: [
@@ -207,8 +229,14 @@ async function triggerCatDrop(guild, channelId) {
   const cat = chooseRandomCat();
   activeDrops.set(channelId, cat);
 
+  let rarityColor = "◽";
+  if (cat.rarity === "Uncommon") rarityColor = "🔷";
+  if (cat.rarity === "Rare") rarityColor = "🔶";
+  if (cat.rarity === "Epic") rarityColor = "🔮";
+  if (cat.rarity === "Legendary") rarityColor = "👑";
+
   await channel.send({
-    content: `🐱 **A WILD CAT HAS APPEARED!** 🐱\n\nA **[${cat.rarity}]** ${cat.emoji} **${cat.name}** has dropped!\nType \`/pickup\` quickly to claim it!`,
+    content: `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n✨ **A WILD CAT HAS APPEARED!** ✨\n\n${rarityColor} Rarity: **[${cat.rarity}]**\n🐈 Identity: ${cat.emoji} **${cat.name}**\n\n👉 *Quick! Type \`/pickup\` to add this cat to your storage collection!*\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`,
   });
 }
 
@@ -226,18 +254,66 @@ function loadCustomServerEmojis() {
   console.log(`Linked ${count} custom server cat emojis dynamically.`);
 }
 
+// Database Get/Set Helpers
+function getServerSetup(guildId) {
+  return db.prepare("SELECT * FROM server_setups WHERE guild_id = ?").get(guildId);
+}
+
+function saveServerChannel(guildId, channelId) {
+  db.prepare(`
+    INSERT INTO server_setups (guild_id, channel_id) 
+    VALUES (?, ?) 
+    ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id
+  `).run(guildId, channelId);
+}
+
+function incrementMessageCounter(guildId) {
+  db.prepare(`
+    INSERT INTO server_setups (guild_id, message_count) 
+    VALUES (?, 1) 
+    ON CONFLICT(guild_id) DO UPDATE SET message_count = message_count + 1
+  `).run(guildId);
+  const res = db.prepare("SELECT message_count FROM server_setups WHERE guild_id = ?").get(guildId);
+  return res ? res.message_count : 1;
+}
+
+function resetMessageCounter(guildId) {
+  db.prepare("UPDATE server_setups SET message_count = 0 WHERE guild_id = ?").run(guildId);
+}
+
+function getUserCatQuantity(userId, catName) {
+  const row = db.prepare("SELECT quantity FROM user_storage WHERE user_id = ? AND cat_name = ?").get(userId, catName);
+  return row ? row.quantity : 0;
+}
+
+function addUserCat(userId, catName, amount = 1) {
+  db.prepare(`
+    INSERT INTO user_storage (user_id, cat_name, quantity) 
+    VALUES (?, ?, ?) 
+    ON CONFLICT(user_id, cat_name) DO UPDATE SET quantity = quantity + excluded.quantity
+  `).run(userId, catName, amount);
+}
+
+function removeUserCat(userId, catName, amount = 1) {
+  db.prepare(`
+    UPDATE user_storage SET quantity = quantity - ? 
+    WHERE user_id = ? AND cat_name = ?
+  `).run(amount, userId, catName);
+}
+
+function getUserInventory(userId) {
+  return db.prepare("SELECT cat_name, quantity FROM user_storage WHERE user_id = ? AND quantity > 0").all(userId);
+}
+
 // --- INITIALIZE SLASH COMMANDS ON CLIENT READY ---
 
 client.once("ready", async () => {
   console.log(`Softcard presence bot online as ${client.user.tag}`);
   console.log(watchedIds.size > 0 ? `Watching ${watchedIds.size} configured Discord user IDs.` : "WATCHED_DISCORD_IDS is empty, syncing every visible presence.");
   
-  // Dynamically attach emoji IDs automatically
   loadCustomServerEmojis();
-  
   console.log(`Initial cached presences: ${syncCachedPresences(true)}`);
 
-  // Register Slash Commands Globally
   const commands = [
     new SlashCommandBuilder()
       .setName("serversetup")
@@ -253,10 +329,10 @@ client.once("ready", async () => {
       .setDescription("View your current inventory of caught cats"),
     new SlashCommandBuilder()
       .setName("trade")
-      .setDescription("Trade your cats with another player")
+      .setDescription("Trade or gift your cats safely with another player")
       .addUserOption((option) => option.setName("user").setDescription("The user you want to trade with").setRequired(true))
       .addStringOption((option) => option.setName("your_cat").setDescription("Name of the cat you are giving").setRequired(true))
-      .addStringOption((option) => option.setName("their_cat").setDescription("Name of the cat you want in return").setRequired(true)),
+      .addStringOption((option) => option.setName("their_cat").setDescription("Name of the cat you want back (Leave blank or 'none' to gift)").setRequired(false)),
   ].map((command) => command.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(token);
@@ -268,21 +344,21 @@ client.once("ready", async () => {
     console.error("Error refreshing slash commands:", error);
   }
 
-  // Sweep task for original presence code
   setInterval(() => {
     const count = syncCachedPresences(false);
     console.log(`Presence sweep checked ${count} cached presences.`);
   }, 60_000);
 
-  // Hourly passive cat spawn loops
+  // Trigger drops once every 10 minutes loop
   setInterval(() => {
-    for (const [guildId, channelId] of serverSetups.entries()) {
-      const guild = client.guilds.cache.get(guildId);
-      if (guild) {
-        triggerCatDrop(guild, channelId).catch(console.error);
+    const rows = db.prepare("SELECT guild_id, channel_id FROM server_setups WHERE channel_id IS NOT NULL").all();
+    for (const row of rows) {
+      const guild = client.guilds.cache.get(row.guild_id);
+      if (guild && row.channel_id) {
+        triggerCatDrop(guild, row.channel_id).catch(console.error);
       }
     }
-  }, 3_600_000); // 1 hour loop
+  }, 600_000); 
 });
 
 // --- INTERACTIONS & MESSAGE LISTENER ---
@@ -291,20 +367,20 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
 
   const guildId = message.guild.id;
-  let targetChannelId = serverSetups.get(guildId);
+  let setup = getServerSetup(guildId);
+  let targetChannelId = setup?.channel_id;
 
-  let currentCount = (messageCounters.get(guildId) || 0) + 1;
-  messageCounters.set(guildId, currentCount);
+  let currentCount = incrementMessageCounter(guildId);
 
   if (currentCount >= 100) {
-    messageCounters.set(guildId, 0); // resets count
+    resetMessageCounter(guildId); 
 
     if (!targetChannelId) {
       const textChannels = message.guild.channels.cache.filter((c) => c.isTextBased());
       if (textChannels.size > 0) {
         const randomChannel = textChannels.random();
         targetChannelId = randomChannel.id;
-        serverSetups.set(guildId, targetChannelId);
+        saveServerChannel(guildId, targetChannelId);
       }
     }
 
@@ -330,42 +406,37 @@ client.on("interactionCreate", async (interaction) => {
       chosenChannel = textChannels.random();
     }
 
-    serverSetups.set(guild.id, chosenChannel.id);
-    return interaction.reply({ content: `✅ Cat drops configured! Drops will occur in <#${chosenChannel.id}>.` });
+    saveServerChannel(guild.id, chosenChannel.id);
+    return interaction.reply({ content: `✅ **Success!** Cat drops configured. Active drops will appear randomly or over time in <#${chosenChannel.id}>.` });
   }
 
   if (commandName === "pickup") {
     const activeCat = activeDrops.get(channelId);
     if (!activeCat) {
-      return interaction.reply({ content: "❌ There is no wild cat to pick up in this channel right now!", ephemeral: true });
+      return interaction.reply({ content: "❌ There is no wild cat running around in this channel right now!", ephemeral: true });
     }
 
     activeDrops.delete(channelId);
-
-    if (!userStorage.has(user.id)) {
-      userStorage.set(user.id, {});
-    }
-    const inventory = userStorage.get(user.id);
-    inventory[activeCat.name] = (inventory[activeCat.name] || 0) + 1;
+    addUserCat(user.id, activeCat.name, 1);
 
     return interaction.reply({
-      content: `🎉 **${user.username}** picked up the **[${activeCat.rarity}]** ${activeCat.emoji} **${activeCat.name}**! It has been safely stored in their \`/catstorage\`.`,
+      content: `🎉 **${user.username}** quickly picked up the **[${activeCat.rarity}]** ${activeCat.emoji} **${activeCat.name}**! It has been safely added to your \`/catstorage\`.`,
     });
   }
 
   if (commandName === "catstorage") {
-    const inventory = userStorage.get(user.id) || {};
-    const items = Object.entries(inventory).filter(([_, qty]) => qty > 0);
+    const items = getUserInventory(user.id);
 
     if (items.length === 0) {
-      return interaction.reply({ content: "🐱 Your storage is empty! Chat more or use `/pickup` when a cat drops.", ephemeral: true });
+      return interaction.reply({ content: "📦 **Your Cat Storage vault is empty!** Chat active channels or secure drops via `/pickup` to fill it up.", ephemeral: true });
     }
 
-    let responseText = `📬 **${user.username}'s Cat Storage:**\n\n`;
-    for (const [name, qty] of items) {
-      const reference = CATS.find((c) => c.name === name);
-      responseText += `${reference ? reference.emoji : "🐱"} **${name}** — x${qty} (\`${reference ? reference.rarity : "Unknown"}\`)\n`;
+    let responseText = `📬 ▬▬ **${user.username.toUpperCase()}'S CAT VAULT** ▬▬ 📬\n\n`;
+    for (const item of items) {
+      const reference = CATS.find((c) => c.name === item.cat_name);
+      responseText += `${reference ? reference.emoji : "🐱"} **${item.cat_name}** × \`${item.quantity}\`  ↳  *[${reference ? reference.rarity : "Common"}]*\n`;
     }
+    responseText += `\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`;
 
     return interaction.reply({ content: responseText });
   }
@@ -373,55 +444,129 @@ client.on("interactionCreate", async (interaction) => {
   if (commandName === "trade") {
     const targetUser = options.getUser("user");
     const yourCatInput = options.getString("your_cat").trim();
-    const theirCatInput = options.getString("their_cat").trim();
+    const theirCatInput = options.getString("their_cat")?.trim() || "none";
 
     if (targetUser.id === user.id) {
-      return interaction.reply({ content: "❌ You cannot trade with yourself!", ephemeral: true });
+      return interaction.reply({ content: "❌ You cannot initiate a trade proposal with yourself!", ephemeral: true });
     }
     if (targetUser.bot) {
-      return interaction.reply({ content: "❌ You cannot trade with bots!", ephemeral: true });
+      return interaction.reply({ content: "❌ Real cats don't build automated machinery. You can't trade with bots!", ephemeral: true });
     }
-
-    const myInventory = userStorage.get(user.id) || {};
-    const targetInventory = userStorage.get(targetUser.id) || {};
 
     const myMatch = CATS.find((c) => c.name.toLowerCase() === yourCatInput.toLowerCase());
-    const theirMatch = CATS.find((c) => c.name.toLowerCase() === theirCatInput.toLowerCase());
-
-    if (!myMatch || !myInventory[myMatch.name] || myInventory[myMatch.name] <= 0) {
+    if (!myMatch || getUserCatQuantity(user.id, myMatch.name) <= 0) {
       return interaction.reply({ content: `❌ You do not own a cat named "${yourCatInput}" to trade away!`, ephemeral: true });
     }
-    if (!theirMatch || !targetInventory[theirMatch.name] || targetInventory[theirMatch.name] <= 0) {
-      return interaction.reply({ content: `❌ ${targetUser.username} does not own a cat named "${theirCatInput}"!`, ephemeral: true });
+
+    let theirMatch = null;
+    const isGift = theirCatInput.toLowerCase() === "none";
+
+    if (!isGift) {
+      theirMatch = CATS.find((c) => c.name.toLowerCase() === theirCatInput.toLowerCase());
+      if (!theirMatch || getUserCatQuantity(targetUser.id, theirMatch.name) <= 0) {
+        return interaction.reply({ content: `❌ ${targetUser.username} doesn't own a cat named "${theirCatInput}" to fulfill their exchange!`, ephemeral: true });
+      }
     }
 
-    const replyMessage = await interaction.reply({
-      content: `🤝 **Trade Proposal!**\n\n${user} wants to trade their ${myMatch.emoji} **${myMatch.name}** for ${targetUser}'s ${theirMatch.emoji} **${theirMatch.name}**.\n\n${targetUser}, type **\`confirm\`** in chat within 60 seconds to accept this trade.`,
-      fetchReply: true,
+    const acceptButtonId = `confirm_trade_${interaction.id}`;
+    const cancelButtonId = `cancel_trade_${interaction.id}`;
+
+    const actionRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(acceptButtonId).setLabel("Accept Trade").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(cancelButtonId).setLabel("Decline / Cancel").setStyle(ButtonStyle.Danger)
+    );
+
+    let displayString = `🤝 ▬▬ **SECURE TRADE OFFER** ▬▬ 🤝\n\n` +
+                        `👤 **Sender:** ${user}\n` +
+                        `📤 **Offering:** ${myMatch.emoji} **${myMatch.name}** (\`${myMatch.rarity}\`)\n\n` +
+                        `👤 **Receiver:** ${targetUser}\n`;
+
+    if (isGift) {
+      displayString += `📥 **Receiving:** 🎁 *Nothing (This is a gift/one-way exchange!)*\n\n`;
+    } else {
+      displayString += `📥 **Requesting:** ${theirMatch.emoji} **${theirMatch.name}** (\`${theirMatch.rarity}\`)\n\n`;
+    }
+
+    displayString += `⚠️ *Both users must have valid inventory amounts. ${targetUser}, click below to confirm exchange securely.*`;
+
+    const offerMessage = await interaction.reply({
+      content: displayString,
+      components: [actionRow],
+      fetchReply: true
     });
 
-    const filter = (m) => m.author.id === targetUser.id && m.content.toLowerCase() === "confirm";
-    const collector = interaction.channel.createMessageCollector({ filter, time: 60_000, max: 1 });
+    const buttonCollector = offerMessage.createMessageComponentCollector({
+      time: 60_000,
+    });
 
-    collector.on("collect", async () => {
-      if (myInventory[myMatch.name] > 0 && targetInventory[theirMatch.name] > 0) {
-        myInventory[myMatch.name] -= 1;
-        myInventory[theirMatch.name] = (myInventory[theirMatch.name] || 0) + 1;
+    let senderConfirmed = false;
+    let receiverConfirmed = false;
 
-        targetInventory[theirMatch.name] -= 1;
-        targetInventory[myMatch.name] = (targetInventory[myMatch.name] || 0) + 1;
+    buttonCollector.on("collect", async (btnInteraction) => {
+      if (btnInteraction.customId === cancelButtonId) {
+        if (btnInteraction.user.id !== user.id && btnInteraction.user.id !== targetUser.id) {
+          return btnInteraction.reply({ content: "❌ You are not involved in this trade deal.", ephemeral: true });
+        }
+        buttonCollector.stop("cancelled");
+        return btnInteraction.reply({ content: `❌ Trade cancelled by ${btnInteraction.user}.` });
+      }
 
-        await interaction.followUp({
-          content: `✅ **Trade Successful!**\n\n${user} received ${theirMatch.emoji} **${theirMatch.name}**\n${targetUser} received ${myMatch.emoji} **${myMatch.name}**!`,
-        });
-      } else {
-        await interaction.followUp({ content: "❌ Trade failed. Inventories changed before completion." });
+      if (btnInteraction.customId === acceptButtonId) {
+        if (btnInteraction.user.id === user.id) {
+          senderConfirmed = true;
+          await btnInteraction.reply({ content: "⏳ You accepted. Waiting on your partner...", ephemeral: true });
+        } else if (btnInteraction.user.id === targetUser.id) {
+          receiverConfirmed = true;
+          await btnInteraction.reply({ content: "⏳ You accepted. Processing data verification...", ephemeral: true });
+        } else {
+          return btnInteraction.reply({ content: "❌ You are not a party inside this transaction.", ephemeral: true });
+        }
+
+        const structuralConditionsMet = isGift ? receiverConfirmed : (senderConfirmed && receiverConfirmed);
+        
+        if (structuralConditionsMet) {
+          buttonCollector.stop("completed");
+        }
       }
     });
 
-    collector.on("end", (_, reason) => {
-      if (reason === "time") {
-        interaction.followUp({ content: `⏳ Trade offer from ${user} to ${targetUser} expired.` }).catch(() => {});
+    buttonCollector.on("end", async (_, reason) => {
+      const disabledRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(acceptButtonId).setLabel("Accept Trade").setStyle(ButtonStyle.Success).setDisabled(true),
+        new ButtonBuilder().setCustomId(cancelButtonId).setLabel("Decline / Cancel").setStyle(ButtonStyle.Danger).setDisabled(true)
+      );
+
+      if (reason === "completed") {
+        // Fetch fresh database balances right before transaction processing
+        const senderHasCat = getUserCatQuantity(user.id, myMatch.name) > 0;
+        const receiverHasCat = isGift || getUserCatQuantity(targetUser.id, theirMatch.name) > 0;
+
+        if (senderHasCat && receiverHasCat) {
+          removeUserCat(user.id, myMatch.name, 1);
+          
+          if (isGift) {
+            addUserCat(targetUser.id, myMatch.name, 1);
+            await interaction.editReply({
+              content: `🎁 **GIFT TRANSACTION COMPLETE!**\n\n${user} gifted ${myMatch.emoji} **${myMatch.name}** directly to ${targetUser}!`,
+              components: [disabledRow]
+            });
+          } else {
+            addUserCat(user.id, theirMatch.name, 1);
+            removeUserCat(targetUser.id, theirMatch.name, 1);
+            addUserCat(targetUser.id, myMatch.name, 1);
+
+            await interaction.editReply({
+              content: `✅ **TRADE TRANSACTION SUCCESSFUL!**\n\n✨ ${user} accepted ${theirMatch.emoji} **${theirMatch.name}**\n✨ ${targetUser} accepted ${myMatch.emoji} **${myMatch.name}**`,
+              components: [disabledRow]
+            });
+          }
+        } else {
+          await interaction.editReply({ content: "❌ **Transaction Aborted:** Inventory values modified or no longer sufficient before clicking confirmation.", components: [disabledRow] });
+        }
+      } else if (reason === "time") {
+        await interaction.editReply({ content: `⏳ **Trade Expired:** 60-second limit reached before confirmations filed.`, components: [disabledRow] }).catch(() => {});
+      } else {
+        await interaction.editReply({ components: [disabledRow] }).catch(() => {});
       }
     });
     return;
