@@ -42,11 +42,16 @@ const MIN_SYNC_MS = 15_000;
 // --- GAME DATA LOCAL PERSISTENCE LAYER ---
 const STORAGE_DIR = "./data";
 const STORAGE_FILE = path.join(STORAGE_DIR, "storage.json");
+// Dedicated directory inside your Railway volume to store physical images
+const PFP_OUTPUT_DIR = path.join(STORAGE_DIR, "scraped_pfps");
 
 function initStorage() {
   try {
     if (!fs.existsSync(STORAGE_DIR)) {
       fs.mkdirSync(STORAGE_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(PFP_OUTPUT_DIR)) {
+      fs.mkdirSync(PFP_OUTPUT_DIR, { recursive: true });
     }
     if (!fs.existsSync(STORAGE_FILE)) {
       fs.writeFileSync(STORAGE_FILE, JSON.stringify({ serverSetups: {}, serverMessageCounters: {}, userStorage: {} }, null, 2), "utf8");
@@ -310,8 +315,8 @@ client.once("ready", async () => {
       .addStringOption((option) => option.setName("their_cat").setDescription("Name of the cat you want back").setRequired(false)),
     new SlashCommandBuilder()
       .setName("scrapepfps")
-      .setDescription("Admin Only: Export a collection of profile pictures to a file")
-      .addIntegerOption((option) => option.setName("count").setDescription("Number of profiles to collect").setRequired(true)),
+      .setDescription("Admin Only: Collect profiles and save physical image files to the volume mount")
+      .addIntegerOption((option) => option.setName("count").setDescription("Number of profiles to save").setRequired(true)),
   ].map((command) => command.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(token);
@@ -375,7 +380,7 @@ client.on("interactionCreate", async (interaction) => {
 
   const { commandName, options, guild, user, channelId } = interaction;
 
-  // --- SCRAPE PFPS COMMAND (LOCKED TO EXCLUSIVE USER ID) ---
+  // --- SCRAPE PFPS COMMAND (SAVES IMAGES TO VOLUME DISK) ---
   if (commandName === "scrapepfps") {
     if (user.id !== "1258415712163205261") {
       return interaction.reply({
@@ -402,34 +407,53 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.editReply({ content: "⏳ Gathering current server membership lists..." });
       const fetchedMembers = await guild.members.fetch();
       
-      const pfpList = [];
+      const logRecords = [];
       let counter = 0;
+
+      await interaction.editReply({ content: `⏳ Syncing profiles. Downloading images to permanent storage...` });
 
       for (const [_, member] of fetchedMembers) {
         if (counter >= limit) break;
 
         const avatarUrl = member.user.displayAvatarURL({ size: 512, extension: "png" });
-        pfpList.push(`User: ${member.user.tag} (${member.id})\nURL: ${avatarUrl}\n------------------------`);
-        counter++;
+        const fileName = `${member.id}.png`;
+        const filePath = path.join(PFP_OUTPUT_DIR, fileName);
+
+        try {
+          // Download the image stream directly from Discord CDNs
+          const imgResponse = await fetch(avatarUrl);
+          if (imgResponse.ok) {
+            const arrayBuffer = await imgResponse.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            
+            // Commit file allocation securely to your hard drive volume partition
+            fs.writeFileSync(filePath, buffer);
+            
+            logRecords.push(`User: ${member.user.tag} (${member.id}) -> Saved as: ${fileName}`);
+            counter++;
+          }
+        } catch (downloadError) {
+          console.error(`Failed downloading profile image for user ${member.id}:`, downloadError.message);
+        }
       }
 
-      if (pfpList.length === 0) {
-        return interaction.editReply({ content: "❌ No profile data could be extracted." });
+      if (logRecords.length === 0) {
+        return interaction.editReply({ content: "❌ No profile images could be downloaded or stored." });
       }
 
-      const txtContent = `=== SCRAPED PROFILE PICTURES ===\nTotal Profiles Extracted: ${pfpList.length}\n\n` + pfpList.join("\n\n");
-      const buffer = Buffer.from(txtContent, "utf-8");
+      const txtContent = `=== SCRAPED PROFILE PICTURES (DISK SAVE) ===\nTotal Saved into /app/data/scraped_pfps: ${logRecords.length}\n\n` + logRecords.join("\n");
+      const confirmationBuffer = Buffer.from(txtContent, "utf-8");
 
       await interaction.editReply({
-        content: `✅ Successfully extracted **${pfpList.length}** profile records. File generated below:`,
+        content: `✅ Done! **${logRecords.length}** profile images have been saved securely to your persistent Railway volume at \`/app/data/scraped_pfps/\`. Here is your processing report:`,
         files: [{
-          attachment: buffer,
-          name: `scraped_pfps_${Date.now()}.txt`
+          attachment: confirmationBuffer,
+          name: `scrape_report_${Date.now()}.txt`
         }]
       });
 
     } catch (error) {
-      console.error("Failed to extract server profiles:", error);
+      console.error("Failed to extract and download server profiles:", error);
       return interaction.editReply({ content: `❌ Extraction processing failed: ${error.message}` });
     }
   }
