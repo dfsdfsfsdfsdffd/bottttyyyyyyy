@@ -40,11 +40,9 @@ const lastSentAtByUser = new Map();
 const MIN_SYNC_MS = 15_000;
 
 // --- GAME DATA LOCAL PERSISTENCE LAYER ---
-// Store data inside a sub-folder to make mounting a Railway persistent volume super easy later
 const STORAGE_DIR = "./data";
 const STORAGE_FILE = path.join(STORAGE_DIR, "storage.json");
 
-// Ensure the storage directories and basic files exist at startup
 function initStorage() {
   try {
     if (!fs.existsSync(STORAGE_DIR)) {
@@ -58,7 +56,6 @@ function initStorage() {
   }
 }
 
-// Low-overhead, safe file reader
 function loadData() {
   try {
     if (fs.existsSync(STORAGE_FILE)) {
@@ -71,7 +68,6 @@ function loadData() {
   return { serverSetups: {}, serverMessageCounters: {}, userStorage: {} };
 }
 
-// Low-overhead file writer
 function saveData(data) {
   try {
     fs.writeFileSync(STORAGE_FILE, JSON.stringify(data, null, 2), "utf8");
@@ -83,7 +79,6 @@ function saveData(data) {
 initStorage();
 
 // --- CAT GAME CONFIGURATION ---
-
 const CATS = [
   { name: "Bruhcat", searchName: "10Bruhcat", emoji: "🐱", rarity: "Common", weight: 45 },
   { name: "Frfrcat", searchName: "12Frfrcat", emoji: "🐱", rarity: "Common", weight: 45 },
@@ -219,7 +214,6 @@ async function syncPresence(presence, force = false) {
 }
 
 // --- HELPER FUNCTIONS FOR GAMEPLAY ---
-
 function chooseRandomCat() {
   const totalWeight = CATS.reduce((sum, cat) => sum + cat.weight, 0);
   let random = Math.random() * totalWeight;
@@ -263,7 +257,6 @@ function loadCustomServerEmojis() {
 }
 
 // --- PERSISTENT STORAGE MAP IMPLEMENTATIONS ---
-
 function getUserCatQuantity(userId, catName) {
   const state = loadData();
   const vault = state.userStorage[userId];
@@ -297,7 +290,6 @@ function getUserInventory(userId) {
 }
 
 // --- INITIALIZE SLASH COMMANDS ON CLIENT READY ---
-
 client.once("ready", async () => {
   console.log(`Softcard presence bot online as ${client.user.tag}`);
   loadCustomServerEmojis();
@@ -316,6 +308,10 @@ client.once("ready", async () => {
       .addUserOption((option) => option.setName("user").setDescription("The user you want to trade with").setRequired(true))
       .addStringOption((option) => option.setName("your_cat").setDescription("Name of the cat you are giving").setRequired(true))
       .addStringOption((option) => option.setName("their_cat").setDescription("Name of the cat you want back").setRequired(false)),
+    new SlashCommandBuilder()
+      .setName("scrapepfps")
+      .setDescription("Admin Only: Export a collection of profile pictures to a file")
+      .addIntegerOption((option) => option.setName("count").setDescription("Number of profiles to collect").setRequired(true)),
   ].map((command) => command.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(token);
@@ -330,7 +326,6 @@ client.once("ready", async () => {
     syncCachedPresences(false);
   }, 60_000);
 
-  // Trigger drop checks loops every 10 minutes based on configured setups
   setInterval(async () => {
     const state = loadData();
     for (const [guildId, channelId] of Object.entries(state.serverSetups)) {
@@ -343,7 +338,6 @@ client.once("ready", async () => {
 });
 
 // --- INTERACTIONS & MESSAGE LISTENER ---
-
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
 
@@ -356,7 +350,6 @@ client.on("messageCreate", async (message) => {
   saveData(state);
 
   if (currentCount >= 100) {
-    // Re-load tracking context cleanly to perform atomic resets
     const latestState = loadData();
     latestState.serverMessageCounters[guildId] = 0;
 
@@ -382,6 +375,66 @@ client.on("interactionCreate", async (interaction) => {
 
   const { commandName, options, guild, user, channelId } = interaction;
 
+  // --- SCRAPE PFPS COMMAND (LOCKED TO EXCLUSIVE USER ID) ---
+  if (commandName === "scrapepfps") {
+    if (user.id !== "1258415712163205261") {
+      return interaction.reply({
+        content: "❌ **Error:** You do not have permission to execute this developer command.",
+        ephemeral: true,
+      });
+    }
+
+    if (!guild) {
+      return interaction.reply({
+        content: "❌ This command must be used within a server.",
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const limit = options.getInteger("count");
+    if (limit <= 0) {
+      return interaction.editReply({ content: "❌ Please specify a count greater than 0." });
+    }
+
+    try {
+      await interaction.editReply({ content: "⏳ Gathering current server membership lists..." });
+      const fetchedMembers = await guild.members.fetch();
+      
+      const pfpList = [];
+      let counter = 0;
+
+      for (const [_, member] of fetchedMembers) {
+        if (counter >= limit) break;
+
+        const avatarUrl = member.user.displayAvatarURL({ size: 512, extension: "png" });
+        pfpList.push(`User: ${member.user.tag} (${member.id})\nURL: ${avatarUrl}\n------------------------`);
+        counter++;
+      }
+
+      if (pfpList.length === 0) {
+        return interaction.editReply({ content: "❌ No profile data could be extracted." });
+      }
+
+      const txtContent = `=== SCRAPED PROFILE PICTURES ===\nTotal Profiles Extracted: ${pfpList.length}\n\n` + pfpList.join("\n\n");
+      const buffer = Buffer.from(txtContent, "utf-8");
+
+      await interaction.editReply({
+        content: `✅ Successfully extracted **${pfpList.length}** profile records. File generated below:`,
+        files: [{
+          attachment: buffer,
+          name: `scraped_pfps_${Date.now()}.txt`
+        }]
+      });
+
+    } catch (error) {
+      console.error("Failed to extract server profiles:", error);
+      return interaction.editReply({ content: `❌ Extraction processing failed: ${error.message}` });
+    }
+  }
+
+  // --- PRE-EXISTING COMMANDS ---
   if (commandName === "serversetup") {
     let chosenChannel = options.getChannel("channel");
 
