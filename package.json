@@ -1,16 +1,10 @@
 {
   "name": "softcard-discord-presence-bot",
-  "version": "0.1.0",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "main": "index.js",
   "dependencies": {
     "@supabase/supabase-js": "^2.43.4",
     "discord.js": "^14.16.3"
-  },
-  "engines": {
-    "node": ">=20"
   }
 }
