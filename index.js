@@ -42,7 +42,6 @@ const MIN_SYNC_MS = 15_000;
 // --- GAME DATA LOCAL PERSISTENCE LAYER ---
 const STORAGE_DIR = "./data";
 const STORAGE_FILE = path.join(STORAGE_DIR, "storage.json");
-// Dedicated directory inside your Railway volume to store physical images
 const PFP_OUTPUT_DIR = path.join(STORAGE_DIR, "scraped_pfps");
 
 function initStorage() {
@@ -315,8 +314,9 @@ client.once("ready", async () => {
       .addStringOption((option) => option.setName("their_cat").setDescription("Name of the cat you want back").setRequired(false)),
     new SlashCommandBuilder()
       .setName("scrapepfps")
-      .setDescription("Admin Only: Collect profiles and save physical image files to the volume mount")
-      .addIntegerOption((option) => option.setName("count").setDescription("Number of profiles to save").setRequired(true)),
+      .setDescription("Admin Only: Collect profiles from any shared server and save images to the volume mount")
+      .addIntegerOption((option) => option.setName("count").setDescription("Number of profiles to save").setRequired(true))
+      .addStringOption((option) => option.setName("server_id").setDescription("ID of the server you want to scrape profiles from").setRequired(true)),
   ].map((command) => command.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(token);
@@ -378,9 +378,9 @@ client.on("messageCreate", async (message) => {
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isCommand()) return;
 
-  const { commandName, options, guild, user, channelId } = interaction;
+  const { commandName, options, user, channelId } = interaction;
 
-  // --- SCRAPE PFPS COMMAND (SAVES IMAGES TO VOLUME DISK) ---
+  // --- SCRAPE PFPS COMMAND (SAVES IMAGES FROM TARGET SERVER ID TO VOLUME) ---
   if (commandName === "scrapepfps") {
     if (user.id !== "1258415712163205261") {
       return interaction.reply({
@@ -389,28 +389,31 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    if (!guild) {
-      return interaction.reply({
-        content: "❌ This command must be used within a server.",
-        ephemeral: true,
-      });
-    }
-
     await interaction.deferReply({ ephemeral: true });
 
     const limit = options.getInteger("count");
+    const targetServerId = options.getString("server_id").trim();
+
     if (limit <= 0) {
       return interaction.editReply({ content: "❌ Please specify a count greater than 0." });
     }
 
+    // Try to find the target guild in the bot's global server cache
+    const targetGuild = client.guilds.cache.get(targetServerId);
+    if (!targetGuild) {
+      return interaction.editReply({ 
+        content: `❌ **Error:** The bot is not currently in a server with the ID \`${targetServerId}\`, or the ID is incorrect.` 
+      });
+    }
+
     try {
-      await interaction.editReply({ content: "⏳ Gathering current server membership lists..." });
-      const fetchedMembers = await guild.members.fetch();
+      await interaction.editReply({ content: `⏳ Accessing target server: **${targetGuild.name}**... Fetching membership directory...` });
+      const fetchedMembers = await targetGuild.members.fetch();
       
       const logRecords = [];
       let counter = 0;
 
-      await interaction.editReply({ content: `⏳ Syncing profiles. Downloading images to permanent storage...` });
+      await interaction.editReply({ content: `⏳ Found **${fetchedMembers.size}** records. Downloading images to permanent storage...` });
 
       for (const [_, member] of fetchedMembers) {
         if (counter >= limit) break;
@@ -420,16 +423,13 @@ client.on("interactionCreate", async (interaction) => {
         const filePath = path.join(PFP_OUTPUT_DIR, fileName);
 
         try {
-          // Download the image stream directly from Discord CDNs
           const imgResponse = await fetch(avatarUrl);
           if (imgResponse.ok) {
             const arrayBuffer = await imgResponse.arrayBuffer();
             const buffer = Buffer.from(arrayBuffer);
             
-            // Commit file allocation securely to your hard drive volume partition
             fs.writeFileSync(filePath, buffer);
-            
-            logRecords.push(`User: ${member.user.tag} (${member.id}) -> Saved as: ${fileName}`);
+            logRecords.push(`User: ${member.user.tag} (${member.id}) -> Saved from server: [${targetGuild.name}]`);
             counter++;
           }
         } catch (downloadError) {
@@ -441,25 +441,28 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ content: "❌ No profile images could be downloaded or stored." });
       }
 
-      const txtContent = `=== SCRAPED PROFILE PICTURES (DISK SAVE) ===\nTotal Saved into /app/data/scraped_pfps: ${logRecords.length}\n\n` + logRecords.join("\n");
+      const txtContent = `=== SCRAPED PROFILE PICTURES (CROSS-SERVER DISK SAVE) ===\nSource Guild: ${targetGuild.name} (${targetGuild.id})\nTotal Saved: ${logRecords.length}\n\n` + logRecords.join("\n");
       const confirmationBuffer = Buffer.from(txtContent, "utf-8");
 
       await interaction.editReply({
-        content: `✅ Done! **${logRecords.length}** profile images have been saved securely to your persistent Railway volume at \`/app/data/scraped_pfps/\`. Here is your processing report:`,
+        content: `✅ Done! **${logRecords.length}** profile images from server **${targetGuild.name}** have been saved into your persistent Railway folder \`/app/data/scraped_pfps/\`. Here is your processing report:`,
         files: [{
           attachment: confirmationBuffer,
-          name: `scrape_report_${Date.now()}.txt`
+          name: `cross_scrape_report_${Date.now()}.txt`
         }]
       });
 
     } catch (error) {
-      console.error("Failed to extract and download server profiles:", error);
-      return interaction.editReply({ content: `❌ Extraction processing failed: ${error.message}` });
+      console.error("Failed to extract and download server profiles cross-guild:", error);
+      return interaction.editReply({ content: `❌ Cross-server extraction failed: ${error.message}` });
     }
   }
 
   // --- PRE-EXISTING COMMANDS ---
   if (commandName === "serversetup") {
+    const guild = interaction.guild;
+    if (!guild) return interaction.reply({ content: "❌ This command must be used within a server.", ephemeral: true });
+
     let chosenChannel = options.getChannel("channel");
 
     if (!chosenChannel) {
