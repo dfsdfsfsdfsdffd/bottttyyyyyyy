@@ -88,8 +88,11 @@ function buildPayload(presence) {
 
 function syncCachedPresences(force = false) {
   let count = 0;
+  const seenUserIds = new Set();
   for (const guild of client.guilds.cache.values()) {
     for (const presence of guild.presences.cache.values()) {
+      if (seenUserIds.has(presence.userId)) continue;
+      seenUserIds.add(presence.userId);
       count += 1;
       syncPresence(presence, force).catch((error) => console.warn(error));
     }
