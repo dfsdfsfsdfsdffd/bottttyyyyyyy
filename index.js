@@ -10,13 +10,10 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from "discord.js";
-import { createClient } from "@supabase/supabase-js";
 
 const token = process.env.DISCORD_BOT_TOKEN;
 const endpoint = process.env.SOFTCARD_PRESENCE_ENDPOINT || "https://softcard.cc/api/discord/presence";
 const secret = process.env.SOFTCARD_PRESENCE_SYNC_SECRET;
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
 
 const watchedIds = new Set(
   (process.env.WATCHED_DISCORD_IDS || "")
@@ -27,12 +24,6 @@ const watchedIds = new Set(
 
 if (!token) throw new Error("Missing DISCORD_BOT_TOKEN.");
 if (!secret) throw new Error("Missing SOFTCARD_PRESENCE_SYNC_SECRET.");
-if (!supabaseUrl || !supabaseKey) throw new Error("Missing SUPABASE_URL or SUPABASE_KEY.");
-
-// Initialize Supabase Client with explicitly configured global fetch to prevent container environment errors
-const supabase = createClient(supabaseUrl, supabaseKey, {
-  auth: { persistSession: false }
-});
 
 const activityNames = {
   [ActivityType.Playing]: "Playing",
@@ -85,7 +76,11 @@ const CATS = [
   { name: "Suscat", searchName: "8Suscat", emoji: "🐱", rarity: "Legendary", weight: 2 }
 ];
 
+// Memory Stores replacing the Supabase structures
 const activeDrops = new Map();
+const serverSetups = new Map(); // Store channel configurations
+const serverMessageCounters = new Map(); // Track messages sent
+const userStorage = new Map(); // Format: userId -> { catName: quantity }
 
 const client = new Client({
   intents: [
@@ -226,54 +221,32 @@ function loadCustomServerEmojis() {
   console.log(`Linked ${count} custom server cat emojis dynamically.`);
 }
 
-// --- SUPABASE DATABASE GET/SET HELPERS ---
+// --- MEMORY VAULT REPLACEMENTS FOR STORAGE LOGIC ---
 
-async function getServerSetup(guildId) {
-  const { data, error } = await supabase.from("server_setups").select("*").eq("guild_id", guildId).maybeSingle();
-  if (error) console.error("Database query error [getServerSetup]:", error.message);
-  return data;
+function getUserCatQuantity(userId, catName) {
+  const vault = userStorage.get(userId);
+  if (!vault) return 0;
+  return vault[catName] || 0;
 }
 
-async function saveServerChannel(guildId, channelId) {
-  const { error } = await supabase.from("server_setups").upsert({ guild_id: guildId, channel_id: channelId }, { onConflict: "guild_id" });
-  if (error) console.error("Database write error [saveServerChannel]:", error.message);
+function addUserCat(userId, catName, amount = 1) {
+  if (!userStorage.has(userId)) {
+    userStorage.set(userId, {});
+  }
+  const vault = userStorage.get(userId);
+  vault[catName] = (vault[catName] || 0) + amount;
 }
 
-async function incrementMessageCounter(guildId) {
-  const setup = await getServerSetup(guildId);
-  const nextCount = (setup?.message_count || 0) + 1;
-  const { error } = await supabase.from("server_setups").upsert({ guild_id: guildId, message_count: nextCount }, { onConflict: "guild_id" });
-  if (error) console.error("Database write error [incrementMessageCounter]:", error.message);
-  return nextCount;
+function removeUserCat(userId, catName, amount = 1) {
+  const vault = userStorage.get(userId);
+  if (!vault || !vault[catName]) return;
+  vault[catName] = Math.max(0, vault[catName] - amount);
+  if (vault[catName] === 0) delete vault[catName];
 }
 
-async function resetMessageCounter(guildId) {
-  const { error } = await supabase.from("server_setups").upsert({ guild_id: guildId, message_count: 0 }, { onConflict: "guild_id" });
-  if (error) console.error("Database write error [resetMessageCounter]:", error.message);
-}
-
-async function getUserCatQuantity(userId, catName) {
-  const { data, error } = await supabase.from("user_storage").select("quantity").eq("user_id", userId).eq("cat_name", catName).maybeSingle();
-  if (error) console.error("Database query error [getUserCatQuantity]:", error.message);
-  return data ? data.quantity : 0;
-}
-
-async function addUserCat(userId, catName, amount = 1) {
-  const currentQuantity = await getUserCatQuantity(userId, catName);
-  const { error } = await supabase.from("user_storage").upsert({ user_id: userId, cat_name: catName, quantity: currentQuantity + amount }, { onConflict: "user_id,cat_name" });
-  if (error) console.error("Database write error [addUserCat]:", error.message);
-}
-
-async function removeUserCat(userId, catName, amount = 1) {
-  const currentQuantity = await getUserCatQuantity(userId, catName);
-  const { error } = await supabase.from("user_storage").upsert({ user_id: userId, cat_name: catName, quantity: Math.max(0, currentQuantity - amount) }, { onConflict: "user_id,cat_name" });
-  if (error) console.error("Database write error [removeUserCat]:", error.message);
-}
-
-async function getUserInventory(userId) {
-  const { data, error } = await supabase.from("user_storage").select("cat_name, quantity").eq("user_id", userId).gt("quantity", 0);
-  if (error) console.error("Database query error [getUserInventory]:", error.message);
-  return data || [];
+function getUserInventory(userId) {
+  const vault = userStorage.get(userId) || {};
+  return Object.entries(vault).map(([cat_name, quantity]) => ({ cat_name, quantity }));
 }
 
 // --- INITIALIZE SLASH COMMANDS ON CLIENT READY ---
@@ -310,19 +283,13 @@ client.once("ready", async () => {
     syncCachedPresences(false);
   }, 60_000);
 
-  // Trigger timed loops every 10 minutes
+  // Trigger timed loops every 10 minutes across setup configurations
   setInterval(async () => {
-    try {
-      const { data: rows } = await supabase.from("server_setups").select("guild_id, channel_id").not("channel_id", "is", null);
-      if (!rows) return;
-      for (const row of rows) {
-        const guild = client.guilds.cache.get(row.guild_id);
-        if (guild && row.channel_id) {
-          triggerCatDrop(guild, row.channel_id).catch(console.error);
-        }
+    for (const [guildId, channelId] of serverSetups.entries()) {
+      const guild = client.guilds.cache.get(guildId);
+      if (guild && channelId) {
+        triggerCatDrop(guild, channelId).catch(console.error);
       }
-    } catch (err) {
-      console.error("Error in drop interval loop:", err.message);
     }
   }, 600_000); 
 });
@@ -333,20 +300,20 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
 
   const guildId = message.guild.id;
-  let setup = await getServerSetup(guildId);
-  let targetChannelId = setup?.channel_id;
+  let targetChannelId = serverSetups.get(guildId);
 
-  let currentCount = await incrementMessageCounter(guildId);
+  const currentCount = (serverMessageCounters.get(guildId) || 0) + 1;
+  serverMessageCounters.set(guildId, currentCount);
 
   if (currentCount >= 100) {
-    await resetMessageCounter(guildId); 
+    serverMessageCounters.set(guildId, 0); 
 
     if (!targetChannelId) {
       const textChannels = message.guild.channels.cache.filter((c) => c.isTextBased());
       if (textChannels.size > 0) {
         const randomChannel = textChannels.random();
         targetChannelId = randomChannel.id;
-        await saveServerChannel(guildId, targetChannelId);
+        serverSetups.set(guildId, targetChannelId);
       }
     }
 
@@ -370,7 +337,7 @@ client.on("interactionCreate", async (interaction) => {
       chosenChannel = textChannels.random();
     }
 
-    await saveServerChannel(guild.id, chosenChannel.id);
+    serverSetups.set(guild.id, chosenChannel.id);
     return interaction.reply({ content: `✅ **Success!** Cat drops configured in <#${chosenChannel.id}>.` });
   }
 
@@ -379,7 +346,7 @@ client.on("interactionCreate", async (interaction) => {
     if (!activeCat) return interaction.reply({ content: "❌ There is no wild cat running around in this channel!", ephemeral: true });
 
     activeDrops.delete(channelId);
-    await addUserCat(user.id, activeCat.name, 1);
+    addUserCat(user.id, activeCat.name, 1);
 
     return interaction.reply({
       content: `🎉 **${user.username}** picked up the **[${activeCat.rarity}]** ${activeCat.emoji} **${activeCat.name}**! Check your \`/catstorage\`.`,
@@ -388,7 +355,7 @@ client.on("interactionCreate", async (interaction) => {
 
   if (commandName === "catstorage") {
     await interaction.deferReply({ ephemeral: true });
-    const items = await getUserInventory(user.id);
+    const items = getUserInventory(user.id);
 
     if (items.length === 0) return interaction.editReply({ content: "📦 **Your Cat Storage vault is empty!**" });
 
@@ -411,7 +378,7 @@ client.on("interactionCreate", async (interaction) => {
     if (targetUser.bot) return interaction.reply({ content: "❌ You can't trade with bots!", ephemeral: true });
 
     const myMatch = CATS.find((c) => c.name.toLowerCase() === yourCatInput.toLowerCase());
-    const myQuantity = myMatch ? await getUserCatQuantity(user.id, myMatch.name) : 0;
+    const myQuantity = myMatch ? getUserCatQuantity(user.id, myMatch.name) : 0;
     if (!myMatch || myQuantity <= 0) return interaction.reply({ content: `❌ You do not own a cat named "${yourCatInput}"!`, ephemeral: true });
 
     let theirMatch = null;
@@ -419,7 +386,7 @@ client.on("interactionCreate", async (interaction) => {
 
     if (!isGift) {
       theirMatch = CATS.find((c) => c.name.toLowerCase() === theirCatInput.toLowerCase());
-      const theirQuantity = theirMatch ? await getUserCatQuantity(targetUser.id, theirMatch.name) : 0;
+      const theirQuantity = theirMatch ? getUserCatQuantity(targetUser.id, theirMatch.name) : 0;
       if (!theirMatch || theirQuantity <= 0) return interaction.reply({ content: `❌ ${targetUser.username} doesn't own a cat named "${theirCatInput}"!`, ephemeral: true });
     }
 
@@ -471,18 +438,18 @@ client.on("interactionCreate", async (interaction) => {
       );
 
       if (reason === "completed") {
-        const senderHasCat = (await getUserCatQuantity(user.id, myMatch.name)) > 0;
-        const receiverHasCat = isGift || (await getUserCatQuantity(targetUser.id, theirMatch.name)) > 0;
+        const senderHasCat = getUserCatQuantity(user.id, myMatch.name) > 0;
+        const receiverHasCat = isGift || getUserCatQuantity(targetUser.id, theirMatch.name) > 0;
 
         if (senderHasCat && receiverHasCat) {
-          await removeUserCat(user.id, myMatch.name, 1);
+          removeUserCat(user.id, myMatch.name, 1);
           if (isGift) {
-            await addUserCat(targetUser.id, myMatch.name, 1);
+            addUserCat(targetUser.id, myMatch.name, 1);
             await interaction.editReply({ content: `🎁 **GIFT COMPLETE!**\n\n${user} gifted ${myMatch.emoji} **${myMatch.name}** to ${targetUser}!`, components: [disabledRow] });
           } else {
-            await addUserCat(user.id, theirMatch.name, 1);
-            await removeUserCat(targetUser.id, theirMatch.name, 1);
-            await addUserCat(targetUser.id, myMatch.name, 1);
+            addUserCat(user.id, theirMatch.name, 1);
+            removeUserCat(targetUser.id, theirMatch.name, 1);
+            addUserCat(targetUser.id, myMatch.name, 1);
             await interaction.editReply({ content: `✅ **TRADE SUCCESSFUL!**\n\n✨ Swapped successfully!`, components: [disabledRow] });
           }
         } else {
