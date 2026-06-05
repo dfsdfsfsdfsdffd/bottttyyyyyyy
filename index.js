@@ -10,6 +10,8 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from "discord.js";
+import fs from "fs";
+import path from "path";
 
 const token = process.env.DISCORD_BOT_TOKEN;
 const endpoint = process.env.SOFTCARD_PRESENCE_ENDPOINT || "https://softcard.cc/api/discord/presence";
@@ -36,6 +38,49 @@ const activityNames = {
 const lastPayloadByUser = new Map();
 const lastSentAtByUser = new Map();
 const MIN_SYNC_MS = 15_000;
+
+// --- GAME DATA LOCAL PERSISTENCE LAYER ---
+// Store data inside a sub-folder to make mounting a Railway persistent volume super easy later
+const STORAGE_DIR = "./data";
+const STORAGE_FILE = path.join(STORAGE_DIR, "storage.json");
+
+// Ensure the storage directories and basic files exist at startup
+function initStorage() {
+  try {
+    if (!fs.existsSync(STORAGE_DIR)) {
+      fs.mkdirSync(STORAGE_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(STORAGE_FILE)) {
+      fs.writeFileSync(STORAGE_FILE, JSON.stringify({ serverSetups: {}, serverMessageCounters: {}, userStorage: {} }, null, 2), "utf8");
+    }
+  } catch (error) {
+    console.error("Failed to initialize storage folders:", error);
+  }
+}
+
+// Low-overhead, safe file reader
+function loadData() {
+  try {
+    if (fs.existsSync(STORAGE_FILE)) {
+      const data = fs.readFileSync(STORAGE_FILE, "utf8");
+      return JSON.parse(data);
+    }
+  } catch (error) {
+    console.error("Error reading data from storage file, returning safe defaults:", error);
+  }
+  return { serverSetups: {}, serverMessageCounters: {}, userStorage: {} };
+}
+
+// Low-overhead file writer
+function saveData(data) {
+  try {
+    fs.writeFileSync(STORAGE_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch (error) {
+    console.error("Error writing data state to storage file:", error);
+  }
+}
+
+initStorage();
 
 // --- CAT GAME CONFIGURATION ---
 
@@ -76,11 +121,7 @@ const CATS = [
   { name: "Suscat", searchName: "8Suscat", emoji: "🐱", rarity: "Legendary", weight: 2 }
 ];
 
-// Memory Stores replacing the Supabase structures
 const activeDrops = new Map();
-const serverSetups = new Map(); // Store channel configurations
-const serverMessageCounters = new Map(); // Track messages sent
-const userStorage = new Map(); // Format: userId -> { catName: quantity }
 
 const client = new Client({
   intents: [
@@ -221,31 +262,37 @@ function loadCustomServerEmojis() {
   console.log(`Linked ${count} custom server cat emojis dynamically.`);
 }
 
-// --- MEMORY VAULT REPLACEMENTS FOR STORAGE LOGIC ---
+// --- PERSISTENT STORAGE MAP IMPLEMENTATIONS ---
 
 function getUserCatQuantity(userId, catName) {
-  const vault = userStorage.get(userId);
+  const state = loadData();
+  const vault = state.userStorage[userId];
   if (!vault) return 0;
   return vault[catName] || 0;
 }
 
 function addUserCat(userId, catName, amount = 1) {
-  if (!userStorage.has(userId)) {
-    userStorage.set(userId, {});
+  const state = loadData();
+  if (!state.userStorage[userId]) {
+    state.userStorage[userId] = {};
   }
-  const vault = userStorage.get(userId);
-  vault[catName] = (vault[catName] || 0) + amount;
+  state.userStorage[userId][catName] = (state.userStorage[userId][catName] || 0) + amount;
+  saveData(state);
 }
 
 function removeUserCat(userId, catName, amount = 1) {
-  const vault = userStorage.get(userId);
+  const state = loadData();
+  const vault = state.userStorage[userId];
   if (!vault || !vault[catName]) return;
+  
   vault[catName] = Math.max(0, vault[catName] - amount);
   if (vault[catName] === 0) delete vault[catName];
+  saveData(state);
 }
 
 function getUserInventory(userId) {
-  const vault = userStorage.get(userId) || {};
+  const state = loadData();
+  const vault = state.userStorage[userId] || {};
   return Object.entries(vault).map(([cat_name, quantity]) => ({ cat_name, quantity }));
 }
 
@@ -283,9 +330,10 @@ client.once("ready", async () => {
     syncCachedPresences(false);
   }, 60_000);
 
-  // Trigger timed loops every 10 minutes across setup configurations
+  // Trigger drop checks loops every 10 minutes based on configured setups
   setInterval(async () => {
-    for (const [guildId, channelId] of serverSetups.entries()) {
+    const state = loadData();
+    for (const [guildId, channelId] of Object.entries(state.serverSetups)) {
       const guild = client.guilds.cache.get(guildId);
       if (guild && channelId) {
         triggerCatDrop(guild, channelId).catch(console.error);
@@ -300,22 +348,28 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
 
   const guildId = message.guild.id;
-  let targetChannelId = serverSetups.get(guildId);
+  const state = loadData();
+  let targetChannelId = state.serverSetups[guildId];
 
-  const currentCount = (serverMessageCounters.get(guildId) || 0) + 1;
-  serverMessageCounters.set(guildId, currentCount);
+  const currentCount = (state.serverMessageCounters[guildId] || 0) + 1;
+  state.serverMessageCounters[guildId] = currentCount;
+  saveData(state);
 
   if (currentCount >= 100) {
-    serverMessageCounters.set(guildId, 0); 
+    // Re-load tracking context cleanly to perform atomic resets
+    const latestState = loadData();
+    latestState.serverMessageCounters[guildId] = 0;
 
     if (!targetChannelId) {
       const textChannels = message.guild.channels.cache.filter((c) => c.isTextBased());
       if (textChannels.size > 0) {
         const randomChannel = textChannels.random();
         targetChannelId = randomChannel.id;
-        serverSetups.set(guildId, targetChannelId);
+        latestState.serverSetups[guildId] = targetChannelId;
       }
     }
+    
+    saveData(latestState);
 
     if (targetChannelId) {
       await triggerCatDrop(message.guild, targetChannelId);
@@ -337,7 +391,10 @@ client.on("interactionCreate", async (interaction) => {
       chosenChannel = textChannels.random();
     }
 
-    serverSetups.set(guild.id, chosenChannel.id);
+    const state = loadData();
+    state.serverSetups[guild.id] = chosenChannel.id;
+    saveData(state);
+
     return interaction.reply({ content: `✅ **Success!** Cat drops configured in <#${chosenChannel.id}>.` });
   }
 
