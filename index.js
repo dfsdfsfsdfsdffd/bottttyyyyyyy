@@ -3,6 +3,7 @@ import {
   Client,
   GatewayIntentBits,
   Partials,
+  PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -47,7 +48,15 @@ const MIN_SYNC_MS = 15_000;
 const STORAGE_DIR = "./data";
 const STORAGE_FILE = path.join(STORAGE_DIR, "storage.json");
 const PFP_OUTPUT_DIR = path.join(STORAGE_DIR, "scraped_pfps");
-const DEFAULT_STORAGE = { serverSetups: {}, serverMessageCounters: {}, userStorage: {}, userItems: {}, exploreCooldowns: {}, catCare: {} };
+const DEFAULT_STORAGE = {
+  serverSetups: {},
+  serverMessageCounters: {},
+  stoppedCatServers: {},
+  userStorage: {},
+  userItems: {},
+  exploreCooldowns: {},
+  catCare: {},
+};
 
 function initStorage() {
   try {
@@ -362,6 +371,7 @@ const CAT_UPGRADE_RECIPES = {
 const HELP_LINES = [
   "`/help` - Show every command and what it does.",
   "`/serversetup [channel]` - Set the channel where wild cats spawn.",
+  "`/stopcat` - Admin: stop wild cat drops for this server. Run `/serversetup` to turn them back on.",
   "`/cat [favorite]` - Open the cat panel. Optionally set your favorite cat.",
   "`/pickup` - Claim the active wild cat in the current channel.",
   "`/trade` - Trade a cat or gift one to another user.",
@@ -526,6 +536,9 @@ function setExploreCooldown(userId) {
 }
 
 async function triggerBetterCatDrop(guild, channelId) {
+  const state = loadData();
+  if (state.stoppedCatServers?.[guild.id]) return;
+
   const channel = guild.channels.cache.get(channelId);
   if (!channel) return;
 
@@ -660,6 +673,9 @@ function chooseRandomCat() {
 }
 
 async function triggerCatDrop(guild, channelId) {
+  const state = loadData();
+  if (state.stoppedCatServers?.[guild.id]) return;
+
   const channel = guild.channels.cache.get(channelId);
   if (!channel) return;
 
@@ -756,6 +772,10 @@ client.once("ready", async () => {
       .setDescription("Configure the spawn channel for cats")
       .addChannelOption((option) => option.setName("channel").setDescription("The channel where cats drop")),
     new SlashCommandBuilder()
+      .setName("stopcat")
+      .setDescription("Admin Only: Stop wild cat drops for this server")
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    new SlashCommandBuilder()
       .setName("cat")
       .setDescription("Open the cat system panel with buttons")
       .addStringOption((option) => option.setName("favorite").setDescription("Optional: set favorite cat by name")),
@@ -797,6 +817,7 @@ client.once("ready", async () => {
   setInterval(async () => {
     const state = loadData();
     for (const [guildId, channelId] of Object.entries(state.serverSetups)) {
+      if (state.stoppedCatServers?.[guildId]) continue;
       const guild = client.guilds.cache.get(guildId);
       if (guild && channelId) {
         triggerBetterCatDrop(guild, channelId).catch(console.error);
@@ -811,6 +832,8 @@ client.on("messageCreate", async (message) => {
 
   const guildId = message.guild.id;
   const state = loadData();
+  if (state.stoppedCatServers?.[guildId]) return;
+
   let targetChannelId = state.serverSetups[guildId];
 
   const currentCount = (state.serverMessageCounters[guildId] || 0) + 1;
@@ -820,6 +843,10 @@ client.on("messageCreate", async (message) => {
   if (currentCount >= 100) {
     const latestState = loadData();
     latestState.serverMessageCounters[guildId] = 0;
+    if (latestState.stoppedCatServers?.[guildId]) {
+      saveData(latestState);
+      return;
+    }
 
     if (!targetChannelId) {
       const textChannels = message.guild.channels.cache.filter((c) => c.isTextBased());
@@ -1362,9 +1389,36 @@ client.on("interactionCreate", async (interaction) => {
 
     const state = loadData();
     state.serverSetups[guild.id] = chosenChannel.id;
+    if (state.stoppedCatServers) delete state.stoppedCatServers[guild.id];
     saveData(state);
 
     return interaction.reply({ content: `✅ **Success!** Cat drops configured in <#${chosenChannel.id}>.` });
+  }
+
+  if (commandName === "stopcat") {
+    const guild = interaction.guild;
+    if (!guild) return interaction.reply({ content: "This command must be used within a server.", ephemeral: true });
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "You need Manage Server permission to stop cat drops.", ephemeral: true });
+    }
+
+    const state = loadData();
+    state.stoppedCatServers = state.stoppedCatServers || {};
+    state.stoppedCatServers[guild.id] = true;
+    state.serverMessageCounters[guild.id] = 0;
+
+    const configuredChannelId = state.serverSetups[guild.id];
+    if (configuredChannelId) {
+      const activeDrop = activeDrops.get(configuredChannelId);
+      if (activeDrop?.timeoutId) clearTimeout(activeDrop.timeoutId);
+      activeDrops.delete(configuredChannelId);
+    }
+
+    saveData(state);
+    return interaction.reply({
+      content: "Cat drops are now stopped for this server. Run `/serversetup` to turn them back on.",
+      ephemeral: true,
+    });
   }
 
   if (commandName === "pickup") {
