@@ -18,7 +18,8 @@ import zlib from "zlib"; // Built-in Node tool for data compression ops
 
 const token = process.env.DISCORD_BOT_TOKEN;
 const endpoint = process.env.SOFTCARD_PRESENCE_ENDPOINT || "https://softcard.cc/api/discord/presence";
-const secret = process.env.SOFTCARD_PRESENCE_SYNC_SECRET;
+const secret = process.env.DISCORD_PRESENCE_SYNC_SECRET || process.env.SOFTCARD_PRESENCE_SYNC_SECRET;
+const presenceGuildId = process.env.DISCORD_GUILD_ID || "";
 const downloadVolumePassword = process.env.DOWNLOAD_VOLUME_PASSWORD || "";
 const MAX_DISCORD_FILE_BYTES = 24.5 * 1024 * 1024;
 
@@ -30,7 +31,7 @@ const watchedIds = new Set(
 );
 
 if (!token) throw new Error("Missing DISCORD_BOT_TOKEN.");
-if (!secret) throw new Error("Missing SOFTCARD_PRESENCE_SYNC_SECRET.");
+if (!secret) throw new Error("Missing DISCORD_PRESENCE_SYNC_SECRET or SOFTCARD_PRESENCE_SYNC_SECRET.");
 
 const activityNames = {
   [ActivityType.Playing]: "Playing",
@@ -38,6 +39,14 @@ const activityNames = {
   [ActivityType.Listening]: "Listening to",
   [ActivityType.Watching]: "Watching",
   [ActivityType.Competing]: "Competing in",
+};
+
+const activityPriority = {
+  [ActivityType.Streaming]: 1,
+  [ActivityType.Listening]: 2,
+  [ActivityType.Playing]: 3,
+  [ActivityType.Watching]: 4,
+  [ActivityType.Competing]: 5,
 };
 
 const lastPayloadByUser = new Map();
@@ -578,7 +587,9 @@ const client = new Client({
 });
 
 function pickActivity(presence) {
-  return presence.activities.find((activity) => activity.type !== ActivityType.Custom) || presence.activities[0];
+  return [...(presence.activities || [])]
+    .filter((activity) => activity.type !== ActivityType.Custom)
+    .sort((a, b) => (activityPriority[a.type] || 99) - (activityPriority[b.type] || 99))[0] || null;
 }
 
 function activityImage(activity) {
@@ -586,14 +597,28 @@ function activityImage(activity) {
   return activity.assets.largeImageURL({ size: 128 }) || activity.assets.smallImageURL({ size: 128 }) || "";
 }
 
+function discordAvatarUrl(user) {
+  if (!user) return "";
+  return user.displayAvatarURL?.({ size: 128, extension: user.avatar?.startsWith?.("a_") ? "gif" : "png" }) || "";
+}
+
+function displayDiscordName(presence, user) {
+  return String(user?.globalName || presence.member?.displayName || user?.username || "Discord").slice(0, 40);
+}
+
 function buildPayload(presence) {
   const activity = pickActivity(presence);
-  const guild = presence.guild;
+  const user = presence.user || presence.member?.user || client.users.cache.get(presence.userId);
+  const guild = (presenceGuildId && client.guilds.cache.get(presenceGuildId)) || presence.guild;
   const guildIcon = guild?.iconURL({ size: 128 }) || "";
   const status = presence.status || "offline";
 
   return {
     discordId: presence.userId,
+    discordName: displayDiscordName(presence, user),
+    discordUsername: user?.username || "",
+    discordAvatar: discordAvatarUrl(user),
+    discordUrl: presence.userId ? `https://discord.com/users/${presence.userId}` : "",
     status,
     activity: activity
       ? {
