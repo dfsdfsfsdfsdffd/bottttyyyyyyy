@@ -362,13 +362,10 @@ const CAT_UPGRADE_RECIPES = {
 const HELP_LINES = [
   "`/help` - Show every command and what it does.",
   "`/serversetup [channel]` - Set the channel where wild cats spawn.",
+  "`/cat [favorite]` - Open the cat panel. Optionally set your favorite cat.",
   "`/pickup` - Claim the active wild cat in the current channel.",
-  "`/explore` - Search for items with a chance to find a cat.",
-  "`/catcare` - Pick a favorite cat, feed it, play with it, and upgrade it.",
-  "`/catstorage` - View your cat vault, score, total cats, and unique cats.",
-  "`/catdex` - View collection progress by rarity.",
-  "`/catleaderboard` - Show the top cat collectors.",
   "`/trade` - Trade a cat or gift one to another user.",
+  "Cat panel buttons - Explore, Vault, Dex, Leaderboard, Care, Feed, Play, Upgrade, Bag.",
   "`/scrapepfps` - Admin: save profile pictures from a shared server.",
   "`/downloadvolume` - Admin: download storage backups with a password.",
 ];
@@ -758,30 +755,11 @@ client.once("ready", async () => {
       .setName("serversetup")
       .setDescription("Configure the spawn channel for cats")
       .addChannelOption((option) => option.setName("channel").setDescription("The channel where cats drop")),
-    new SlashCommandBuilder().setName("pickup").setDescription("Pick up an active cat drop in this channel"),
-    new SlashCommandBuilder().setName("explore").setDescription("Explore for items and maybe find a cat"),
-    new SlashCommandBuilder().setName("catstorage").setDescription("View your current inventory of caught cats"),
-    new SlashCommandBuilder().setName("catdex").setDescription("View your cat collection progress by rarity"),
-    new SlashCommandBuilder().setName("catleaderboard").setDescription("View the richest cat collectors"),
     new SlashCommandBuilder()
-      .setName("catcare")
-      .setDescription("Care for one favorite cat in one command")
-      .addSubcommand((subcommand) => subcommand.setName("status").setDescription("Show your favorite cat care panel"))
-      .addSubcommand((subcommand) =>
-        subcommand
-          .setName("favorite")
-          .setDescription("Pick the cat you want to care for")
-          .addStringOption((option) => option.setName("cat").setDescription("Cat name").setRequired(true))
-      )
-      .addSubcommand((subcommand) =>
-        subcommand
-          .setName("feed")
-          .setDescription("Feed your favorite cat")
-          .addStringOption((option) => option.setName("food").setDescription("Food item name").setRequired(false))
-      )
-      .addSubcommand((subcommand) => subcommand.setName("play").setDescription("Play with your favorite cat using a Yarn Ball or Tiny Bell"))
-      .addSubcommand((subcommand) => subcommand.setName("upgrade").setDescription("Upgrade your favorite cat to a higher rarity if you have the items"))
-      .addSubcommand((subcommand) => subcommand.setName("bag").setDescription("Show your explore items")),
+      .setName("cat")
+      .setDescription("Open the cat system panel with buttons")
+      .addStringOption((option) => option.setName("favorite").setDescription("Optional: set favorite cat by name")),
+    new SlashCommandBuilder().setName("pickup").setDescription("Pick up an active cat drop in this channel"),
     new SlashCommandBuilder()
       .setName("trade")
       .setDescription("Trade or gift your cats safely with another player")
@@ -860,7 +838,192 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+function catPanelComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("cat:explore").setLabel("Explore").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("cat:care").setLabel("Care").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("cat:feed").setLabel("Feed").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("cat:play").setLabel("Play").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("cat:upgrade").setLabel("Upgrade").setStyle(ButtonStyle.Danger),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("cat:vault").setLabel("Vault").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("cat:dex").setLabel("Dex").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("cat:bag").setLabel("Bag").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("cat:leaderboard").setLabel("Leaderboard").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("cat:panel").setLabel("Home").setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+function catHomeEmbed(user) {
+  const items = getUserInventory(user.id);
+  const stats = inventoryStats(items);
+  const care = normalizedCare(user.id);
+  const favorite = catRef(care.favoriteCat);
+  return new EmbedBuilder()
+    .setTitle("Cat System")
+    .setDescription("Use the buttons below. Use `/cat favorite:<cat name>` once to pick the cat you care for.")
+    .addFields(
+      { name: "Collection", value: `Score: **${stats.score}**\nCats: **${stats.totalCats}**\nUnique: **${stats.uniqueCats}/${CATS.length}**`, inline: true },
+      { name: "Favorite", value: favorite ? `${favorite.emoji} **${favorite.name}** [${favorite.rarity}]\nHunger: **${care.hunger}/100**\nHappy: **${care.happiness}/100**` : "No favorite selected.", inline: true },
+      { name: "Core commands", value: "`/cat` panel\n`/pickup` catch spawned cats\n`/trade` trade/gift cats", inline: false },
+    )
+    .setColor(0x62d26f);
+}
+
+function vaultEmbed(user) {
+  const items = getUserInventory(user.id);
+  if (items.length === 0) {
+    return new EmbedBuilder().setTitle("Cat Vault").setDescription("Your cat vault is empty. Use `/pickup` on spawned cats or Explore from this panel.").setColor(0x62d26f);
+  }
+  const stats = inventoryStats(items);
+  return new EmbedBuilder()
+    .setTitle(`${user.username}'s Cat Vault`)
+    .setDescription(items.slice(0, 25).map((item) => formatCat(item.cat_name, item.quantity)).join("\n"))
+    .addFields({ name: "Stats", value: `Score: **${stats.score}** | Total: **${stats.totalCats}** | Unique: **${stats.uniqueCats}/${CATS.length}**` })
+    .setColor(0x62d26f);
+}
+
+function dexEmbed(user) {
+  const items = getUserInventory(user.id);
+  const owned = new Set(items.map((item) => item.cat_name));
+  const stats = inventoryStats(items);
+  const lines = Object.keys(CAT_RARITY_INFO).map((rarity) => {
+    const rarityCats = CATS.filter((cat) => cat.rarity === rarity);
+    const ownedCount = rarityCats.filter((cat) => owned.has(cat.name)).length;
+    return `**${rarity}**: ${ownedCount}/${rarityCats.length} unique, ${stats.byRarity[rarity] || 0} total`;
+  });
+  return new EmbedBuilder()
+    .setTitle(`${user.username}'s CatDex`)
+    .setDescription(lines.join("\n"))
+    .addFields({ name: "Collection", value: `**${stats.uniqueCats}/${CATS.length}** unique | Score: **${stats.score}**` })
+    .setColor(0x62d26f);
+}
+
+function bagEmbed(user) {
+  const items = getUserItems(user.id);
+  return new EmbedBuilder()
+    .setTitle(`${user.username}'s Explore Bag`)
+    .setDescription(items.length ? items.map((item) => `**${item.name}** x \`${item.quantity}\``).join("\n") : "Your bag is empty. Press Explore to find care and upgrade items.")
+    .setColor(0x62d26f);
+}
+
+async function leaderboardEmbed(interaction) {
+  const rows = getLeaderboard(10);
+  if (rows.length === 0) return new EmbedBuilder().setTitle("Cat Leaderboard").setDescription("No cat collectors yet.").setColor(0x62d26f);
+  const lines = await Promise.all(rows.map(async (row, index) => {
+    const member = interaction.guild?.members.cache.get(row.userId) || await interaction.guild?.members.fetch(row.userId).catch(() => null);
+    return `**${index + 1}.** ${member?.user?.username || row.userId} - **${row.score}** pts, ${row.uniqueCats}/${CATS.length} unique, ${row.totalCats} total`;
+  }));
+  return new EmbedBuilder().setTitle("Cat Leaderboard").setDescription(lines.join("\n")).setColor(0x62d26f);
+}
+
+function exploreEmbedForUser(user) {
+  const remainingMs = getExploreCooldown(user.id);
+  if (remainingMs > 0) {
+    const remainingSeconds = Math.ceil(remainingMs / 1000);
+    return new EmbedBuilder()
+      .setTitle("Explore cooldown")
+      .setDescription(`Rest first. Try again in **${Math.ceil(remainingSeconds / 60)}m ${remainingSeconds % 60}s**.`)
+      .setColor(0xffb020);
+  }
+
+  setExploreCooldown(user.id);
+  const foundItem = chooseWeighted(EXPLORE_ITEMS);
+  addUserItem(user.id, foundItem.name, 1);
+  const foundCat = Math.random() < 0.18;
+  let catLine = "No cat followed you home this time.";
+  if (foundCat) {
+    const cat = chooseRandomCat();
+    addUserCat(user.id, cat.name, 1);
+    const rarity = CAT_RARITY_INFO[cat.rarity] || CAT_RARITY_INFO.Common;
+    catLine = `${cat.emoji} **${cat.name}** [${cat.rarity}], worth **${rarity.points}** points.`;
+  }
+  const itemTotal = getUserItems(user.id).reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+  return new EmbedBuilder()
+    .setTitle(`${user.username} explored the alleys`)
+    .addFields(
+      { name: "Item found", value: `**${foundItem.name}** [${foundItem.rarity}]`, inline: true },
+      { name: "Cat encounter", value: catLine, inline: false },
+      { name: "Bag", value: `**${itemTotal}** total item${itemTotal === 1 ? "" : "s"}`, inline: true },
+    )
+    .setColor(foundCat ? 0xf5b942 : 0x62d26f);
+}
+
+function careActionEmbed(user, action) {
+  let care = normalizedCare(user.id);
+  if (!care.favoriteCat || getUserCatQuantity(user.id, care.favoriteCat) <= 0) {
+    return new EmbedBuilder().setTitle("Pick a favorite cat").setDescription("Use `/cat favorite:<cat name>` first.").setColor(0xffb020);
+  }
+
+  if (action === "care") return careEmbed(user, care);
+  if (action === "feed") {
+    const food = getUserItems(user.id).find((item) => CAT_FOOD_ITEMS.has(item.name));
+    if (!food) return new EmbedBuilder().setTitle("No food").setDescription("Explore for Cat Treats, Fish Snacks, or Ancient Catnip.").setColor(0xffb020);
+    removeUserItem(user.id, food.name, 1);
+    care.hunger = Math.min(100, Number(care.hunger || 0) + (food.name === "Ancient Catnip" ? 45 : food.name === "Fish Snack" ? 30 : 22));
+    care.happiness = Math.min(100, Number(care.happiness || 0) + 8);
+    care.xp = Number(care.xp || 0) + 5;
+    if (care.xp >= care.level * 25) {
+      care.xp = 0;
+      care.level += 1;
+    }
+    saveCare(user.id, care);
+    return careEmbed(user, care, `Fed ${care.favoriteCat} with ${food.name}`);
+  }
+  if (action === "play") {
+    const toy = getUserItemQuantity(user.id, "Yarn Ball") > 0 ? "Yarn Ball" : getUserItemQuantity(user.id, "Tiny Bell") > 0 ? "Tiny Bell" : "";
+    if (!toy) return new EmbedBuilder().setTitle("No toy").setDescription("Explore for a Yarn Ball or Tiny Bell.").setColor(0xffb020);
+    removeUserItem(user.id, toy, 1);
+    care.happiness = Math.min(100, Number(care.happiness || 0) + (toy === "Tiny Bell" ? 32 : 22));
+    care.hunger = Math.max(0, Number(care.hunger || 0) - 6);
+    care.xp = Number(care.xp || 0) + 6;
+    if (care.xp >= care.level * 25) {
+      care.xp = 0;
+      care.level += 1;
+    }
+    saveCare(user.id, care);
+    return careEmbed(user, care, `Played with ${care.favoriteCat}`);
+  }
+  if (action === "upgrade") {
+    const currentCat = catRef(care.favoriteCat);
+    const recipe = currentCat ? CAT_UPGRADE_RECIPES[currentCat.rarity] : null;
+    if (!recipe) return careEmbed(user, care, "This cat is already max rarity");
+    if (care.hunger < 60 || care.happiness < 60) return new EmbedBuilder().setTitle("Care required").setDescription("Your favorite cat needs at least 60 hunger and 60 happiness before upgrading.").setColor(0xffb020);
+    if (!consumeRecipeItems(user.id, recipe)) return careEmbed(user, care, "Missing upgrade items");
+    const upgradedCat = randomCatByRarity(recipe.next);
+    removeUserCat(user.id, currentCat.name, 1);
+    addUserCat(user.id, upgradedCat.name, 1);
+    care.favoriteCat = upgradedCat.name;
+    care.hunger = Math.max(35, care.hunger - 25);
+    care.happiness = Math.max(35, care.happiness - 20);
+    care.level += 1;
+    care.xp = 0;
+    saveCare(user.id, care);
+    return careEmbed(user, care, `${currentCat.name} upgraded into ${upgradedCat.name}`);
+  }
+  return catHomeEmbed(user);
+}
+
+async function catPanelPayload(interaction, action = "panel") {
+  if (action === "explore") return { embeds: [exploreEmbedForUser(interaction.user)], components: catPanelComponents() };
+  if (action === "vault") return { embeds: [vaultEmbed(interaction.user)], components: catPanelComponents() };
+  if (action === "dex") return { embeds: [dexEmbed(interaction.user)], components: catPanelComponents() };
+  if (action === "bag") return { embeds: [bagEmbed(interaction.user)], components: catPanelComponents() };
+  if (action === "leaderboard") return { embeds: [await leaderboardEmbed(interaction)], components: catPanelComponents() };
+  if (["care", "feed", "play", "upgrade"].includes(action)) return { embeds: [careActionEmbed(interaction.user, action)], components: catPanelComponents() };
+  return { embeds: [catHomeEmbed(interaction.user)], components: catPanelComponents() };
+}
+
 client.on("interactionCreate", async (interaction) => {
+  if (interaction.isButton()) {
+    if (!interaction.customId.startsWith("cat:")) return;
+    const action = interaction.customId.split(":")[1] || "panel";
+    return interaction.update(await catPanelPayload(interaction, action));
+  }
+
   if (!interaction.isCommand()) return;
 
   const { commandName, options, user, channelId } = interaction;
@@ -1035,6 +1198,19 @@ client.on("interactionCreate", async (interaction) => {
       ephemeral: true,
       embeds: [helpEmbed],
     });
+  }
+
+  if (commandName === "cat") {
+    const favoriteInput = options.getString("favorite");
+    if (favoriteInput) {
+      const cat = findCat(favoriteInput);
+      if (!cat || getUserCatQuantity(user.id, cat.name) <= 0) {
+        return interaction.reply({ content: `You do not own a cat matching "${favoriteInput}".`, ephemeral: true });
+      }
+      const currentCare = normalizedCare(user.id);
+      saveCare(user.id, { ...careDefaults(cat.name), level: currentCare.level || 1, xp: currentCare.xp || 0 });
+    }
+    return interaction.reply({ ...(await catPanelPayload(interaction, "panel")), ephemeral: true });
   }
 
   if (commandName === "explore") {
