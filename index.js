@@ -65,6 +65,7 @@ const DEFAULT_STORAGE = {
   userItems: {},
   exploreCooldowns: {},
   catCare: {},
+  giveaways: {},
 };
 
 function initStorage() {
@@ -381,6 +382,7 @@ const HELP_LINES = [
   "`/help` - Show every command and what it does.",
   "`/serversetup [channel]` - Set the channel where wild cats spawn.",
   "`/stopcat` - Admin: stop wild cat drops for this server. Run `/serversetup` to turn them back on.",
+  "`/giveaway` - Admin: start a timed giveaway with a join button.",
   "`/cat [favorite]` - Open the cat panel. Optionally set your favorite cat.",
   "`/pickup` - Claim the active wild cat in the current channel.",
   "`/trade` - Trade a cat or gift one to another user.",
@@ -784,6 +786,124 @@ function getLeaderboard(limit = 10) {
     .slice(0, limit);
 }
 
+// --- GIVEAWAY SYSTEM ---
+const GIVEAWAY_DURATIONS = [
+  { label: "10 seconds", value: "10s", ms: 10 * 1000 },
+  { label: "5 minutes", value: "5m", ms: 5 * 60 * 1000 },
+  { label: "30 minutes", value: "30m", ms: 30 * 60 * 1000 },
+  { label: "1 hour", value: "1h", ms: 60 * 60 * 1000 },
+  { label: "5 hours", value: "5h", ms: 5 * 60 * 60 * 1000 },
+  { label: "24 hours", value: "24h", ms: 24 * 60 * 60 * 1000 },
+  { label: "48 hours", value: "48h", ms: 48 * 60 * 60 * 1000 },
+];
+const activeGiveawayTimers = new Map();
+
+function getGiveawayDuration(value) {
+  return GIVEAWAY_DURATIONS.find((duration) => duration.value === value) || GIVEAWAY_DURATIONS[0];
+}
+
+function formatGiveawayDuration(ms) {
+  const seconds = Math.max(0, Math.ceil(ms / 1000));
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"}`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.ceil(minutes / 60);
+  return `${hours} hour${hours === 1 ? "" : "s"}`;
+}
+
+function giveawayEmbed(giveaway, ended = false, winners = []) {
+  const entrantCount = giveaway.entrants?.length || 0;
+  const endsTimestamp = Math.floor(giveaway.endsAt / 1000);
+  const description = ended
+    ? winners.length
+      ? `Winner${winners.length === 1 ? "" : "s"}: ${winners.map((id) => `<@${id}>`).join(", ")}`
+      : "No valid entries were submitted."
+    : `Ends <t:${endsTimestamp}:R>\nHosted by <@${giveaway.hostId}>`;
+
+  return new EmbedBuilder()
+    .setTitle(ended ? "Giveaway Ended" : "Giveaway")
+    .setDescription(description)
+    .addFields(
+      { name: "Prize", value: giveaway.prize, inline: false },
+      { name: "Entries", value: String(entrantCount), inline: true },
+      { name: "Winners", value: String(giveaway.winnerCount), inline: true },
+      { name: "Ends", value: `<t:${endsTimestamp}:f>`, inline: true },
+    )
+    .setColor(ended ? 0x8a8f98 : 0x62d26f);
+}
+
+function giveawayComponents(giveaway, ended = false) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`giveaway:join:${giveaway.id}`)
+        .setLabel(ended ? "Giveaway Ended" : "Enter Giveaway")
+        .setStyle(ended ? ButtonStyle.Secondary : ButtonStyle.Success)
+        .setDisabled(ended),
+    ),
+  ];
+}
+
+function saveGiveaway(giveaway) {
+  const state = loadData();
+  state.giveaways = state.giveaways || {};
+  state.giveaways[giveaway.id] = giveaway;
+  saveData(state);
+}
+
+function getGiveaway(id) {
+  const state = loadData();
+  return state.giveaways?.[id] || null;
+}
+
+function pickGiveawayWinners(entrants, count) {
+  const shuffled = [...new Set(entrants || [])].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, Math.max(1, count));
+}
+
+function scheduleGiveawayEnd(giveaway) {
+  if (activeGiveawayTimers.has(giveaway.id)) clearTimeout(activeGiveawayTimers.get(giveaway.id));
+  const remainingMs = Math.max(0, giveaway.endsAt - Date.now());
+  const timeoutId = setTimeout(() => {
+    endGiveaway(giveaway.id).catch((error) => console.error("Giveaway end failed:", error));
+  }, remainingMs);
+  activeGiveawayTimers.set(giveaway.id, timeoutId);
+}
+
+async function endGiveaway(giveawayId) {
+  const giveaway = getGiveaway(giveawayId);
+  if (!giveaway || giveaway.ended) return;
+
+  activeGiveawayTimers.delete(giveawayId);
+  const winners = pickGiveawayWinners(giveaway.entrants, giveaway.winnerCount);
+  const endedGiveaway = { ...giveaway, ended: true, winners };
+  saveGiveaway(endedGiveaway);
+
+  const channel = await client.channels.fetch(giveaway.channelId).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  const message = await channel.messages.fetch(giveaway.messageId).catch(() => null);
+  if (message) {
+    await message.edit({
+      embeds: [giveawayEmbed(endedGiveaway, true, winners)],
+      components: giveawayComponents(endedGiveaway, true),
+    }).catch(() => {});
+  }
+
+  if (winners.length > 0) {
+    await channel.send(`Giveaway ended for **${giveaway.prize}**. Winner${winners.length === 1 ? "" : "s"}: ${winners.map((id) => `<@${id}>`).join(", ")}`);
+  } else {
+    await channel.send(`Giveaway ended for **${giveaway.prize}**. No one entered.`);
+  }
+}
+
+function resumeGiveawayTimers() {
+  const state = loadData();
+  for (const giveaway of Object.values(state.giveaways || {})) {
+    if (!giveaway.ended) scheduleGiveawayEnd(giveaway);
+  }
+}
+
 // --- INITIALIZE SLASH COMMANDS ON CLIENT READY ---
 client.once("ready", async () => {
   console.log(`Softcard presence bot online as ${client.user.tag}`);
@@ -800,6 +920,26 @@ client.once("ready", async () => {
       .setName("stopcat")
       .setDescription("Admin Only: Stop wild cat drops for this server")
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    new SlashCommandBuilder()
+      .setName("giveaway")
+      .setDescription("Admin Only: Start a timed giveaway")
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+      .addStringOption((option) => option.setName("prize").setDescription("What users can win").setRequired(true))
+      .addStringOption((option) =>
+        option
+          .setName("time")
+          .setDescription("How long the giveaway should run")
+          .setRequired(true)
+          .addChoices(...GIVEAWAY_DURATIONS.map((duration) => ({ name: duration.label, value: duration.value })))
+      )
+      .addIntegerOption((option) =>
+        option
+          .setName("winners")
+          .setDescription("Number of winners")
+          .setMinValue(1)
+          .setMaxValue(20)
+      )
+      .addChannelOption((option) => option.setName("channel").setDescription("Channel to post the giveaway in")),
     new SlashCommandBuilder()
       .setName("cat")
       .setDescription("Open the cat system panel with buttons")
@@ -834,6 +974,8 @@ client.once("ready", async () => {
   } catch (error) {
     console.error("Error refreshing slash commands:", error);
   }
+
+  resumeGiveawayTimers();
 
   setInterval(() => {
     syncCachedPresences(false);
@@ -1071,6 +1213,40 @@ async function catPanelPayload(interaction, action = "panel") {
 
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isButton()) {
+    if (interaction.customId.startsWith("giveaway:join:")) {
+      const giveawayId = interaction.customId.split(":")[2];
+      const giveaway = getGiveaway(giveawayId);
+
+      if (!giveaway) {
+        return interaction.reply({ content: "This giveaway no longer exists.", ephemeral: true });
+      }
+
+      if (giveaway.ended || Date.now() >= giveaway.endsAt) {
+        await endGiveaway(giveaway.id).catch((error) => console.error("Giveaway close failed:", error));
+        return interaction.reply({ content: "This giveaway has already ended.", ephemeral: true });
+      }
+
+      if (giveaway.entrants?.includes(interaction.user.id)) {
+        return interaction.reply({ content: "You are already entered in this giveaway.", ephemeral: true });
+      }
+
+      const updatedGiveaway = {
+        ...giveaway,
+        entrants: [...(giveaway.entrants || []), interaction.user.id],
+      };
+      saveGiveaway(updatedGiveaway);
+
+      const message = await interaction.message.fetch().catch(() => null);
+      if (message) {
+        await message.edit({
+          embeds: [giveawayEmbed(updatedGiveaway)],
+          components: giveawayComponents(updatedGiveaway),
+        }).catch(() => {});
+      }
+
+      return interaction.reply({ content: `You entered the giveaway for **${giveaway.prize}**.`, ephemeral: true });
+    }
+
     if (!interaction.customId.startsWith("cat:")) return;
     const action = interaction.customId.split(":")[1] || "panel";
     return interaction.update(await catPanelPayload(interaction, action));
@@ -1079,6 +1255,56 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isCommand()) return;
 
   const { commandName, options, user, channelId } = interaction;
+
+  if (commandName === "giveaway") {
+    if (!interaction.guild) {
+      return interaction.reply({ content: "This command must be used within a server.", ephemeral: true });
+    }
+
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "You need Manage Server permission to start giveaways.", ephemeral: true });
+    }
+
+    const prize = options.getString("prize", true).trim().slice(0, 250);
+    const duration = getGiveawayDuration(options.getString("time", true));
+    const winnerCount = options.getInteger("winners") || 1;
+    const targetChannel = options.getChannel("channel") || interaction.channel;
+
+    if (!prize) {
+      return interaction.reply({ content: "Please enter a prize.", ephemeral: true });
+    }
+
+    if (!targetChannel?.isTextBased()) {
+      return interaction.reply({ content: "Please choose a text channel for the giveaway.", ephemeral: true });
+    }
+
+    const giveaway = {
+      id: `${interaction.id}-${Date.now()}`,
+      guildId: interaction.guild.id,
+      channelId: targetChannel.id,
+      messageId: "",
+      prize,
+      hostId: user.id,
+      winnerCount,
+      endsAt: Date.now() + duration.ms,
+      entrants: [],
+      ended: false,
+    };
+
+    const message = await targetChannel.send({
+      embeds: [giveawayEmbed(giveaway)],
+      components: giveawayComponents(giveaway),
+    });
+
+    giveaway.messageId = message.id;
+    saveGiveaway(giveaway);
+    scheduleGiveawayEnd(giveaway);
+
+    return interaction.reply({
+      content: `Giveaway started in ${targetChannel} for **${prize}**. Duration: **${formatGiveawayDuration(duration.ms)}**.`,
+      ephemeral: true,
+    });
+  }
 
   // --- DOWNLOAD VOLUME COMMAND ---
   if (commandName === "downloadvolume") {
