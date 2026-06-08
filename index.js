@@ -858,7 +858,7 @@ function getGiveaway(id) {
 
 function pickGiveawayWinners(entrants, count) {
   const shuffled = [...new Set(entrants || [])].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, Math.max(1, count));
+  return shuffled.slice(0, Math.min(shuffled.length, Math.max(1, count)));
 }
 
 function scheduleGiveawayEnd(giveaway) {
@@ -891,9 +891,9 @@ async function endGiveaway(giveawayId) {
   }
 
   if (winners.length > 0) {
-    await channel.send(`Giveaway ended for **${giveaway.prize}**. Winner${winners.length === 1 ? "" : "s"}: ${winners.map((id) => `<@${id}>`).join(", ")}`);
+    await channel.send(`Giveaway ended for **${giveaway.prize}**. Winner${winners.length === 1 ? "" : "s"}: ${winners.map((id) => `<@${id}>`).join(", ")}`).catch(() => {});
   } else {
-    await channel.send(`Giveaway ended for **${giveaway.prize}**. No one entered.`);
+    await channel.send(`Giveaway ended for **${giveaway.prize}**. No one entered.`).catch(() => {});
   }
 }
 
@@ -1252,7 +1252,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.update(await catPanelPayload(interaction, action));
   }
 
-  if (!interaction.isCommand()) return;
+  if (!interaction.isChatInputCommand()) return;
 
   const { commandName, options, user, channelId } = interaction;
 
@@ -1278,6 +1278,8 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: "Please choose a text channel for the giveaway.", ephemeral: true });
     }
 
+    await interaction.deferReply({ ephemeral: true });
+
     const giveaway = {
       id: `${interaction.id}-${Date.now()}`,
       guildId: interaction.guild.id,
@@ -1294,15 +1296,23 @@ client.on("interactionCreate", async (interaction) => {
     const message = await targetChannel.send({
       embeds: [giveawayEmbed(giveaway)],
       components: giveawayComponents(giveaway),
+    }).catch((error) => {
+      console.error("Failed to create giveaway message:", error);
+      return null;
     });
+
+    if (!message) {
+      return interaction.editReply({
+        content: `I could not post the giveaway in ${targetChannel}. Make sure I can View Channel and Send Messages there.`,
+      });
+    }
 
     giveaway.messageId = message.id;
     saveGiveaway(giveaway);
     scheduleGiveawayEnd(giveaway);
 
-    return interaction.reply({
+    return interaction.editReply({
       content: `Giveaway started in ${targetChannel} for **${prize}**. Duration: **${formatGiveawayDuration(duration.ms)}**.`,
-      ephemeral: true,
     });
   }
 
